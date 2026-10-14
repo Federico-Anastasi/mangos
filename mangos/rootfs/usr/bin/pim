@@ -1,0 +1,233 @@
+#!/bin/sh
+# pim: commands the entity and its room. It is how the agent (or anyone on the phone) makes it
+# change face, say something, show a page or furnish the room.
+#
+#   pim face <neutral|happy|surprised|focused|sorry|doubtful|knowing|sleepy|asleep>
+#   pim say "text"              the phrase the entity shows
+#   pim gesture <yes|jump|wink>
+#   pim reload                  makes the browser reread the UI, after it has been modified
+#   pim walk <forward|back|left|right> [amount]
+#   pim turn <left|right> [amount]
+#                               moves the view along the corridor of rooms, like dragging a finger
+#                               on the screen (1 = one long step, or about 20 degrees)
+#   pim screenshot <file.png>   photographs what the screen really shows
+#   pim show <file.html> [window|background|full]
+#                               opens the page in a window of the room, as a background in place
+#                               of the room, or in full (a game: only the entity stays, small in
+#                               the corner); either way it keeps it in the collection
+#   pim close                   closes the window (the page stays in the collection)
+#   pim pages                   list of the pages in the collection (JSON)
+#   pim house                   how the room is furnished (JSON)
+#   pim house walls <#rrggbb>   wall color
+#   pim house put <id> <file> <wall|left|right> <x> <y> <size> [room]
+#   pim house put <id> <file> floor <x> <near> <size> [room]
+#   pim house remove <id>
+#   pim screen <on|off>
+#   pim volume [0-100]          tells the speaker volume, or sets it (like the keys)
+#   pim poweroff                powers the phone off; with the cable plugged in it stays on
+#                               showing the charging battery, and the side key turns it back on
+#   pim poweron                 leaves off-charging, like the side key
+#   pim vibrate [milliseconds]  makes the phone vibrate (300 if no duration is given, 2000 at most)
+#   pim photo [front] [file.jpg]
+#                               takes a photo with the rear camera (or the one above the screen)
+#                               and prints its path (without a file: in /var/lib/mangos/photos).
+#                               For a few seconds before the shot the UI shows in a small window
+#                               what the camera sees, and then the shot
+#   pim voice                   listens for a phrase from the microphone, like tapping the mic
+#   pim speak "text"            speaks the text aloud through the speaker
+#   pim speech [local|cloud]    where speech is transcribed and the voice made: on the phone
+#                               (Parakeet and Piper, no network), or by Deepgram in the cloud (needs
+#                               the network and the key in /etc/mangos/deepgram-key). Without a
+#                               choice, tells which. It stays across reboots and restarts the
+#                               transcription and voice services
+#   pim agents [1|2]            one Claude Code behind the entity (model= in /etc/mangos/entity), or
+#                               two: the one that talks and a worker (worker_model=) for the heavy
+#                               jobs. Without a number, tells how many. It stays across reboots and
+#                               restarts the agent, which resumes its conversations
+#   pim message "text"          sends a message to the entity, as if the person had typed it
+#   pim status                  battery, Wi-Fi, name and color, whether the worker is working, and
+#                               the machine sensors (temperatures, frequencies, frames per second),
+#                               as JSON
+#
+# Object measures. Back wall and floor: x goes from -1 (left) to 1 (right). Side walls (left,
+# right): x goes from 0 (far end) to 1 (front). y goes from 0 (floor) to 1 (ceiling) and is the
+# center of the object. On the floor "near" goes from 0 (against the back wall) to 1 (front).
+# size is the width, 1 = as wide as the room. The room is the stretch of corridor, from 0 (the
+# first, in front) to 3; without it, the first.
+BRIDGE=http://127.0.0.1:8098
+SURFACES=/var/lib/mangos/surfaces
+HOUSE_FILES=/var/lib/mangos/house
+VOICE_SETTINGS=/etc/mangos/voice
+ENTITY=/etc/mangos/entity
+
+# Writes a JSON string: backslashes, quotes and newlines; tabs become spaces and the other
+# control characters disappear.
+json_escape() {
+	printf '%s' "$1" | tr '\t' ' ' | tr -d '\000-\010\013-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk 'BEGIN { ORS = "" } NR > 1 { print "\\n" } { print }'
+}
+
+# Sends a JSON object to the bridge. If the bridge refuses, prints the reason it gives.
+send() {
+	reply=$(curl -s --fail-with-body -H 'Content-Type: application/json' -d "$2" "$BRIDGE/$1") || {
+		echo "pim: ${reply:-the bridge does not answer (mangos-bridge service)}" >&2
+		exit 1
+	}
+}
+
+check_number() {
+	case "$1" in
+	'' | *[!0-9.-]*) ;;
+	*) if printf '%s' "$1" | grep -Eq '^-?[0-9]+(\.[0-9]+)?$'; then return; fi ;;
+	esac
+	echo "pim: \"$1\" is not a number" >&2
+	exit 2
+}
+
+# Runs a command as root: the camera and the screen belong to root.
+as_root() {
+	if [ "$(id -u)" = 0 ]; then "$@"; else doas "$@"; fi
+}
+
+fail() {
+	echo "pim: $1" >&2
+	exit 1
+}
+
+# Shows a choice kept in a settings file, or, given a value, saves it and restarts the services
+# that read it, saying how each one went: option <file> <key> <default> <value> [service...]
+option() {
+	file=$1 key=$2 default=$3 value=$4
+	if [ -z "$value" ]; then
+		sed -n "s/^$key=//p" "$file" 2> /dev/null | tail -n 1 | grep . || echo "$default"
+		return
+	fi
+	shift 4
+	if grep -q "^$key=" "$file" 2> /dev/null; then
+		sed -i "s/^$key=.*/$key=$value/" "$file"
+	else
+		echo "$key=$value" >> "$file"
+	fi
+	failed=
+	for service in "$@"; do
+		if rc-service "$service" restart > /dev/null; then
+			echo "$service: restarted"
+		else
+			echo "pim: $service did not restart" >&2
+			failed=1
+		fi
+	done
+	echo "$key: $value"
+	[ -z "$failed" ]
+}
+
+# Whether the Piper voice in use (voice= in the settings, or any installed one) exists.
+piper_voice_installed() {
+	for file in /opt/mangos/voices/$(option "$VOICE_SETTINGS" voice '*').onnx; do
+		[ -s "$file" ] && return
+	done
+	return 1
+}
+
+case "$1" in
+face) send command "{\"type\": \"face\", \"name\": \"$(json_escape "$2")\"}" ;;
+say) send command "{\"type\": \"say\", \"text\": \"$(json_escape "$2")\"}" ;;
+gesture) send command "{\"type\": \"gesture\", \"name\": \"$(json_escape "$2")\"}" ;;
+reload) send command '{"type": "reload"}' ;;
+walk | turn)
+	check_number "${3:-1}"
+	send command "{\"type\": \"$1\", \"direction\": \"$(json_escape "$2")\", \"amount\": ${3:-1}}" ;;
+show)
+	[ -f "$2" ] || { echo "pim: $2 does not exist" >&2; exit 1; }
+	name=$(basename "$2")
+	cp "$2" "$SURFACES/$name" || exit 1
+	case "${3:-window}" in
+	window | background | full) ;;
+	*) echo "pim: window, background or full" >&2; exit 2 ;;
+	esac
+	send command "{\"type\": \"surface\", \"mode\": \"${3:-window}\", \"url\": \"/surfaces/$(json_escape "$name")?$(date +%s)\"}"
+	;;
+close) send command '{"type": "surface", "url": null}' ;;
+pages) curl -sS "$BRIDGE/pages" ;;
+house)
+	case "$2" in
+	'') curl -sS "$BRIDGE/house" ;;
+	walls) send house "{\"action\": \"walls\", \"color\": \"$(json_escape "$3")\"}" ;;
+	put)
+		[ -f "$4" ] || { echo "pim: $4 does not exist" >&2; exit 1; }
+		check_number "$6"; check_number "$7"; check_number "$8"
+		room=
+		if [ -n "$9" ]; then check_number "$9"; room=", \"room\": $9"; fi
+		file=$(basename "$4")
+		cp "$4" "$HOUSE_FILES/$file" || exit 1
+		case "$5" in
+		wall | left | right) where_json="\"where\": \"$5\", \"x\": $6, \"y\": $7" ;;
+		floor) where_json="\"where\": \"floor\", \"x\": $6, \"near\": $7" ;;
+		*) echo "pim: wall, left, right or floor" >&2; exit 2 ;;
+		esac
+		send house "{\"action\": \"put\", \"id\": \"$(json_escape "$3")\", \"file\": \"$(json_escape "$file")\", $where_json, \"size\": $8$room}"
+		;;
+	remove) send house "{\"action\": \"remove\", \"id\": \"$(json_escape "$3")\"}" ;;
+	*) echo "pim: house walls, put or remove" >&2; exit 2 ;;
+	esac
+	;;
+screen)
+	case "$2" in
+	on) send command '{"type": "screen", "on": true}' ;;
+	off) send command '{"type": "screen", "on": false}' ;;
+	*) echo "pim: screen on or off" >&2; exit 2 ;;
+	esac
+	;;
+volume)
+	if [ -n "$2" ]; then
+		check_number "$2"
+		send command "{\"type\": \"volume\", \"level\": $2}"
+	else
+		curl -sS "$BRIDGE/status" | grep -o '"volume": [0-9]*' | cut -d' ' -f2
+	fi
+	;;
+poweroff) send command '{"type": "poweroff"}' ;;
+poweron) send command '{"type": "poweron"}' ;;
+vibrate)
+	check_number "${2:-300}"
+	send device "{\"action\": \"vibrate\", \"ms\": ${2:-300}}" ;;
+photo)
+	shift
+	which=
+	[ "$1" = front ] && { which=--front; shift; }
+	# With the preview on the UI (three seconds at most): whoever is in front of the phone sees
+	# what is being looked at. The photo has a long side of 1280 pixels: enough to look at, and
+	# it costs whoever reads it much less than the full one (taken with mangos-photo).
+	as_root mangos-photo $which --preview 3 --long-side 1280 ${1:+-o "$1"}
+	;;
+screenshot)
+	[ -n "$2" ] || { echo "pim: screenshot <file.png>" >&2; exit 2; }
+	as_root env XDG_RUNTIME_DIR=/run/user/0 WAYLAND_DISPLAY=wayland-0 grim -s 0.4 "$2" && as_root chown "$(id -u)" "$2" ;;
+voice) send voice '{}' ;;
+speak) mangos-speak "$2" ;;
+speech)
+	case "$2" in
+	'') option "$VOICE_SETTINGS" speech local ;;
+	local | cloud)
+		[ "$(id -u)" = 0 ] || exec doas "$0" "$@"
+		if [ "$2" = cloud ]; then
+			[ -s /etc/mangos/deepgram-key ] || fail "/etc/mangos/deepgram-key is missing (scripts/phone_deepgram.sh puts it there)"
+		else
+			[ -s /opt/mangos/asr/parakeet-v3/encoder-model.int8.onnx ] || fail "the Parakeet model is missing from /opt/mangos/asr"
+			piper_voice_installed || fail "there is no Piper voice in /opt/mangos/voices"
+		fi
+		option "$VOICE_SETTINGS" speech local "$2" mangos-parakeet mangos-speak || exit 1
+		if [ "$2" = local ]; then echo "the models are still loading: speech works once they have"; fi ;;
+	*) echo "pim: speech local or cloud" >&2; exit 2 ;;
+	esac ;;
+agents)
+	case "$2" in
+	'') option "$ENTITY" agents 1 ;;
+	1 | 2)
+		[ "$(id -u)" = 0 ] || exec doas "$0" "$@"
+		option "$ENTITY" agents 1 "$2" mangos-agent ;;
+	*) echo "pim: agents 1 or 2" >&2; exit 2 ;;
+	esac ;;
+message) send user "{\"type\": \"text\", \"text\": \"$(json_escape "$2")\"}" ;;
+status) curl -sS "$BRIDGE/status" ;;
+*) awk 'NR == 1 { next } !/^#/ { exit } { sub(/^# ?/, ""); print }' "$0"; exit 2 ;;
+esac

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Removes the marker left by the ramdisk: from here on the boot succeeded. If the marker stays,
+# the ramdisk treats this boot as failed on the next one and starts the fallback system.
+# It runs before the hardware modules load: if one hangs the kernel, the watchdog reboots the
+# phone and mangOS starts again without that module, not the fallback.
+rm -f /.boot-pending

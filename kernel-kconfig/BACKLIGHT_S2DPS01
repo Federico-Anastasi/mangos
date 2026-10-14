@@ -1,0 +1,7 @@
+config BACKLIGHT_S2DPS01
+	tristate "Samsung S2DPS01 backlight"
+	depends on I2C
+	help
+	  Backlight driver IC of some Samsung Exynos 850 phones such as
+	  the SM-M135F, controlled over I2C.
+

@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""mangos-agent: gives the entity a voice.
+
+Keeps Claude Code running and passes it, one after another, the messages the person writes (they
+come from the bridge). The reply appears on the screen one phrase at a time, while the model
+writes it. Claude Code runs as user "pim"; /home/pim/CLAUDE.md tells it who it is, and the files
+of /usr/share/mangos/pim add what its role needs (ROLES). It becomes root with doas. If the
+process dies it restarts at the next message and resumes the same conversation.
+
+If the person spoke instead of typing, the message reaches the model starting with "(spoken) "
+and every phrase of the reply is also spoken through the speaker as soon as it is finished
+(mangos-speak), unless /etc/mangos/voice says reply_by_voice=no; once the reply is spoken the
+bridge reopens the mic. Messages starting with "(mangOS)" come from the system: the screen does
+not show them as the person's.
+
+When the model uses a tool and the turn is still not over after two seconds, the laptop appears
+in front of the entity on the screen ("work" event); it disappears when the turn ends. If the
+conversation gets long it has it summarized (/compact): at once if it is very long, otherwise
+after a pause.
+
+One agent or two, by agents= in /etc/mangos/entity (pim agents switches it):
+  1 (the default)   one Claude Code, role "solo" (model=, haiku if missing): talks and does every job
+  2                 the one that talks (role "talker", model=) hands the heavy jobs to a second
+                    Claude Code (role "worker", worker_model=, sonnet if missing), run here in a
+                    thread. They are separate sessions that write to each other with SendMessage;
+                    each keeps its own conversation. When the worker writes back, the talker wakes
+                    up by itself: that turn is shown and, if a voice conversation is open, spoken,
+                    with the mic held closed while it speaks.
+
+Files: the subscription token in /etc/mangos/claude-token (written by scripts/phone_token.sh); in
+/etc/mangos/entity, besides name and color, model=, agents=, worker_model=.
+"""
+import json
+import os
+import pwd
+import queue
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.request
+
+BRIDGE = "http://127.0.0.1:8098"
+BRIDGE_TIMEOUT_S = 40
+TOKEN = "/etc/mangos/claude-token"
+ENTITY = "/etc/mangos/entity"
+VOICE = "/etc/mangos/voice"
+SPEAK_SOCKET = "/run/mangos-speak.sock"
+# Where a phrase ends in text arriving in chunks: a closing mark followed by a space (not at the
+# end of a chunk: "3." may be the start of "3.5"), or a newline.
+PHRASE_END = re.compile(r'[.!?…:]+["»)]*\s+|\n+')
+HOME_DIR = "/home/pim"
+PROMPTS = "/usr/share/mangos/pim"
+SESSION_SETTINGS = PROMPTS + "/sessions.json"    # accepts messages from other sessions
+# A role is a session of its own. `name` is what the other sessions see (the role prompts address
+# the talker and the worker by it); its conversation lives in `folder`; its prompt is CLAUDE.md
+# (read from /home/pim by every folder) plus the `parts` files; `denied` are tools it cannot use.
+ROLES = {
+    "solo": {"name": "pim", "folder": HOME_DIR, "parts": ("voice", "craft"),
+             "error_log": "/var/log/mangos-claude.log"},
+    "talker": {"name": "talker", "folder": HOME_DIR + "/talker", "parts": ("voice", "talker"),
+               "error_log": "/var/log/mangos-claude.log", "denied": "Write,Edit,NotebookEdit,WebSearch,WebFetch"},
+    "worker": {"name": "worker", "folder": HOME_DIR + "/worker", "parts": ("craft", "worker"),
+               "error_log": "/var/log/mangos-worker-claude.log"},
+}
+SYSTEM_PREFIX = "(mangOS)"
+WORKER_STARTED = ("(mangOS) You were just started. If a job was in progress, tell the talker it was "
+                  "interrupted and resume it; otherwise wait for jobs.")
+# What the person is told when a turn fails: the first pattern found in the error text, else the
+# generic phrase of the case.
+FAILURES = (
+    (re.compile(re.escape(TOKEN) + r"|/login|Invalid (API key|auth token)|Not logged in"),
+     "Non riesco ad accedere a Claude: il token manca o non è valido."),
+    (re.compile(r"hit your|reached your|out of (extra )?usage|usage (limit|credits)", re.I),
+     "Ho finito i messaggi disponibili, riprovo più tardi."),
+    (re.compile(r"Unable to connect to API|Connection (error|dropped)"),
+     "Non c'è rete: non riesco a raggiungere Claude."),
+)
+MAX_TURN_S = 900                # a longer turn is interrupted
+# A resumed session that closes its output this soon, before any answer, had no conversation to resume.
+RESUME_FAILED_S = 30
+MAX_LINE = 280                  # how much text fits on the screen
+MAX_VOICE_S = 120               # how long a spoken reply can last: beyond it we stop waiting for the voice
+# The laptop appears if the turn is still going this long after the first tool: for an instant
+# command (changing face) it is not worth taking it out.
+LAPTOP_AFTER_S = 2
+SUMMARIZE_AFTER_S = 1800        # pause after the last message, before the summary
+SUMMARIZE_ABOVE = 20000         # below this size (in tokens) summarizing is not worth it
+# Above this size it summarizes right after the reply, without waiting for the pause: every
+# model call carries the whole conversation, and a huge one slows down every reply.
+SUMMARIZE_NOW_ABOVE = 60000
+SUMMARY_REQUEST = ("/compact Keep what the person asked and likes, what was made and where, "
+                   "and what is still pending.")
+
+
+def call_bridge(path, data=None):
+    request = urllib.request.Request(BRIDGE + path)
+    if data is not None:
+        request.data = json.dumps(data).encode()
+        request.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(request, timeout=BRIDGE_TIMEOUT_S) as response:
+        body = response.read()
+    return json.loads(body) if body else None
+
+
+def to_ui(**event):
+    """Sends an event to the UI. If the bridge does not answer (it is being restarted) it logs
+    it and goes on: the reply is not lost because of this."""
+    try:
+        call_bridge("/command", event)
+    except OSError as error:
+        print(f"mangos-agent: bridge not answering ({event['type']}): {error}", file=sys.stderr, flush=True)
+
+
+def read_pairs(path):
+    """The key=value lines of a settings file; lines starting with # are comments."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return {}
+    pairs = (line.split("=", 1) for line in lines if "=" in line and not line.lstrip().startswith("#"))
+    return {key.strip(): value.strip() for key, value in pairs}
+
+
+def pim_ids():
+    entry = pwd.getpwnam("pim")
+    return entry.pw_uid, entry.pw_gid
+
+
+def role_prompt(role):
+    """The instructions of a role: who it is, then the files of its role."""
+    entity = read_pairs(ENTITY)
+    texts = [f"Your name is {entity.get('name', 'mangOS')} and your color is {entity.get('color', 'blue')}."]
+    for part in ROLES[role]["parts"]:
+        with open(f"{PROMPTS}/{part}.md", encoding="utf-8") as f:
+            texts.append(f.read().strip())
+    return "\n\n".join(texts)
+
+
+def failure_phrase(error, generic):
+    """What to tell the person about a failed turn, from the error text."""
+    for pattern, phrase in FAILURES:
+        if pattern.search(error):
+            return phrase
+    return generic
+
+
+def starts_turn(event):
+    """Whether an event the session writes by itself, between our messages, opens a turn: a
+    message from another session woke it. Other events (rate limits, lifecycle) do not."""
+    kind = event.get("type")
+    return kind in ("stream_event", "assistant") or (kind == "system" and event.get("subtype") == "init")
+
+
+class Claude:
+    """A Claude Code kept running for a role: receives messages as JSON lines and answers with
+    JSON lines."""
+
+    def __init__(self, role, model):
+        self.role, self.model = role, model
+        settings = ROLES[role]
+        self.name, self.folder, self.error_log = settings["name"], settings["folder"], settings["error_log"]
+        self.denied = settings.get("denied")
+        self.marker = self.folder + "/.conversation-started"    # exists once there is a conversation to resume
+        os.makedirs(self.folder, exist_ok=True)
+        os.chown(self.folder, *pim_ids())
+        self.process = None
+        self.lines = None
+        self.resuming = False       # started with --continue and no answer yet
+        self.started_at = 0.0
+        self.context_tokens = 0     # tokens of the conversation after the last turn
+        self.last_turn = None       # when the last turn ended; None after a summary
+
+    def alive(self):
+        return self.process is not None and self.process.poll() is None
+
+    def start(self):
+        with open(TOKEN) as f:
+            token = f.read().strip()
+        command = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+                   "--verbose", "--include-partial-messages", "--model", self.model,
+                   "--dangerously-skip-permissions", "--settings", SESSION_SETTINGS,
+                   "--name", self.name, "--append-system-prompt", role_prompt(self.role),
+                   # A resumed conversation follows the instructions as they are now, not as they
+                   # were when it began: they change, also by the entity's own hand.
+                   "--system-prompt-snapshot", "off"]
+        if self.denied:
+            command += ["--disallowed-tools", self.denied]
+        self.resuming = os.path.exists(self.marker)
+        if self.resuming:
+            command.append("--continue")
+        env = {"HOME": HOME_DIR, "USER": "pim", "LOGNAME": "pim", "LANG": "C.UTF-8",
+               "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "CLAUDE_CODE_OAUTH_TOKEN": token,
+               "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
+        # In its own session: if the turn must be interrupted, whatever it started is closed too.
+        with open(self.error_log, "a") as errors:
+            self.process = subprocess.Popen(command, cwd=self.folder, env=env, user="pim", group="pim",
+                                            extra_groups=[], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                            stderr=errors, text=True, start_new_session=True)
+        self.started_at = time.monotonic()
+        self.lines = queue.Queue()
+        threading.Thread(target=self.read_lines, args=(self.process, self.lines), daemon=True).start()
+
+    def next_event(self, timeout):
+        """The next event the session writes, None if nothing arrives within `timeout`, or the
+        string "closed" if the process closed its output."""
+        try:
+            line = self.lines.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        if line is None:
+            if self.resuming and time.monotonic() - self.started_at < RESUME_FAILED_S:
+                self.resuming = False
+                try:
+                    os.unlink(self.marker)  # there was nothing to resume: the next start is a new conversation
+                except FileNotFoundError:
+                    pass
+                print(f"mangos-agent: {self.name}: no conversation to resume, starting a new one", file=sys.stderr, flush=True)
+            return "closed"
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
+    def read_lines(process, lines):
+        for line in process.stdout:
+            lines.put(line)
+        lines.put(None)             # the process closed its output
+
+    def stop(self):
+        """Closes Claude Code and everything it started."""
+        try:
+            os.killpg(self.process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def turn(self, text, on_chunk=None, on_tool=None, started=None):
+        """Sends a message and waits for the end of the turn. Returns (reply, error). The text
+        the model writes is given to `on_chunk` as it arrives; `on_tool` is called every time the
+        model starts using a tool. With `text` None it sends nothing and follows the turn the
+        session began by itself, whose first event is `started`."""
+        if text is not None:
+            if not self.alive():
+                try:
+                    self.start()
+                except OSError as error:
+                    return None, f"Claude Code failed to start: {error}"
+            message = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+            try:
+                self.process.stdin.write(json.dumps(message) + "\n")
+                self.process.stdin.flush()
+            except OSError as error:
+                return None, f"Claude Code closed its input: {error}"
+        deadline = time.monotonic() + MAX_TURN_S
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.stop()
+                return None, f"did not finish in {MAX_TURN_S // 60} minutes"
+            if started is not None:
+                event, started = started, None
+            else:
+                event = self.next_event(remaining)
+            if event is None:
+                continue
+            if event == "closed":
+                return None, f"Claude Code exited (details in {self.error_log})"
+            chunk = event.get("event") or {} if event.get("type") == "stream_event" else {}
+            if on_tool and chunk.get("type") == "content_block_start" and (chunk.get("content_block") or {}).get("type") == "tool_use":
+                on_tool()
+            if on_chunk:
+                if chunk.get("type") == "content_block_delta" and (chunk.get("delta") or {}).get("type") == "text_delta":
+                    on_chunk(chunk["delta"].get("text", ""))
+                elif chunk.get("type") == "content_block_stop":
+                    on_chunk("\n")              # a finished text block is a finished phrase
+            if event.get("type") == "assistant":
+                # How long the conversation is: what the model read on the last call.
+                # (The turn total, which arrives at the end, sums all the calls.)
+                usage = (event.get("message") or {}).get("usage") or {}
+                read_tokens = sum(usage.get(k, 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+                self.context_tokens = read_tokens or self.context_tokens
+            if event.get("type") != "result":
+                continue
+            self.resuming = False
+            self.last_turn = time.monotonic()
+            if event.get("is_error"):
+                return None, str(event.get("result"))[-300:]
+            open(self.marker, "w").close()
+            return str(event.get("result", "")).strip(), None
+
+    def summarize_if_needed(self):
+        """Summarizes the conversation after a long pause, if it is long too; if it is very
+        long, at once."""
+        if not self.alive() or self.last_turn is None or self.context_tokens < SUMMARIZE_ABOVE:
+            return
+        if self.context_tokens < SUMMARIZE_NOW_ABOVE and time.monotonic() - self.last_turn < SUMMARIZE_AFTER_S:
+            return
+        before = self.context_tokens
+        _, error = self.turn(SUMMARY_REQUEST)
+        self.last_turn = None       # one summary per pause
+        if error:
+            print(f"mangos-agent: summary failed: {error}", file=sys.stderr, flush=True)
+        else:
+            print(f"mangos-agent: conversation summarized (was {before} tokens)", file=sys.stderr, flush=True)
+
+
+class ReplyStream:
+    """The reply while the model writes it, cut into phrases. Without voice each phrase goes to
+    the screen as soon as it is written. With voice it goes to the mangos-speak service over a
+    single connection, which keeps the speaker open from one phrase to the next (so the voice
+    starts at the first phrase, not when the reply is complete), and the screen follows the
+    voice instead of running ahead of it: the service says when each sentence starts being heard,
+    and its words appear one by one while it is said."""
+
+    def __init__(self, by_voice):
+        self.rest, self.shown, self.sent = "", "", 0
+        self.spoken = ""                # everything given to the voice, for when it fails
+        self.heard_any = False
+        self.result = None              # what the voice service answered at the end
+        self.done = threading.Event()
+        self.writer = None
+        if by_voice:
+            try:
+                self.sock = socket.socket(socket.AF_UNIX)
+                self.sock.settimeout(MAX_VOICE_S)
+                self.sock.connect(SPEAK_SOCKET)
+                self.sock.settimeout(None)      # the model may work minutes between two phrases
+                self.writer = self.sock.makefile("w", encoding="utf-8")
+                self.reader = self.sock.makefile("r", encoding="utf-8")
+                self.send({"stream": True})
+                threading.Thread(target=self.listen, daemon=True).start()
+            except OSError as error:
+                print(f"mangos-agent: voice service not answering: {error}", file=sys.stderr, flush=True)
+                self.writer = None
+        self.voiced = self.writer is not None
+
+    def send(self, what):
+        if self.writer:
+            try:
+                self.writer.write(json.dumps(what) + "\n")
+                self.writer.flush()
+            except OSError:
+                self.writer = None              # the voice was stopped, or the service died
+
+    def show(self, words):
+        """Adds words to the line on the screen; a full line starts over."""
+        if len(self.shown) + len(words) + 1 > MAX_LINE:
+            self.shown = ""
+        self.shown = (self.shown + " " + words).strip()
+        to_ui(type="say", text=self.shown)
+
+    def listen(self):
+        """What the voice service writes back: a line for each sentence as it starts being heard,
+        then the result."""
+        try:
+            for line in self.reader:
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    message = None
+                if not isinstance(message, dict):
+                    self.result = line.strip()
+                    break
+                if message.get("heard"):
+                    self.heard_any = True
+                    self.reveal(str(message["heard"]), float(message.get("seconds") or 0))
+        except (OSError, ValueError):
+            pass
+        self.done.set()
+
+    def reveal(self, sentence, seconds):
+        """The words of the sentence one by one, spread over a little less than its length, so
+        that the next sentence never waits for the screen."""
+        words = sentence.split()
+        for i, word in enumerate(words):
+            self.show(word)
+            if i < len(words) - 1:
+                time.sleep(0.9 * seconds * len(word) / max(1, len(sentence)))
+
+    def add(self, text):
+        """A piece of text just written by the model."""
+        self.rest += text
+        while True:
+            end = PHRASE_END.search(self.rest)
+            if not end:
+                break
+            phrase, self.rest = self.rest[:end.end()], self.rest[end.end():]
+            self.phrase(phrase)
+
+    def phrase(self, phrase):
+        """A finished phrase: it is spoken whole; on the screen only one line fits."""
+        if not phrase.strip():
+            return
+        self.sent += 1
+        if self.voiced:
+            self.send({"text": phrase})
+            self.spoken = (self.spoken + " " + " ".join(phrase.split())).strip()
+        elif len(self.shown) < MAX_LINE:
+            self.shown = (self.shown + " " + " ".join(phrase.split())).strip()
+            to_ui(type="say", text=self.shown[:MAX_LINE])
+
+    def tool(self):
+        """The model starts a job: what it writes next is another thing to show."""
+        if not self.voiced:
+            self.shown = ""
+
+    def finish(self, reply):
+        """At the end of the turn: speaks what is left (the whole reply, if nothing came
+        through the stream) and returns when the voice is done. If the voice failed or was
+        stopped, what it did not say appears at once."""
+        if reply is not None:
+            self.phrase(self.rest if self.sent else reply)
+        if not self.voiced:
+            return
+        self.send({"end": True})
+        self.done.wait(MAX_VOICE_S)
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        if self.spoken and (self.result != "0" or not self.heard_any):
+            to_ui(type="say", text=self.spoken[:MAX_LINE])
+
+
+class Laptop:
+    """The laptop in front of the entity while it works: up LAPTOP_AFTER_S after the first
+    tool, down when the turn ends."""
+
+    def __init__(self):
+        self.timer, self.closed = None, False
+        self.lock = threading.Lock()
+
+    def tool(self):
+        if self.timer is None:
+            self.timer = threading.Timer(LAPTOP_AFTER_S, self.up)
+            self.timer.daemon = True
+            self.timer.start()
+
+    def up(self):
+        with self.lock:
+            if not self.closed:
+                to_ui(type="work", active=True, who="agent")
+
+    def close(self):
+        """The laptop always goes down, even if it never came up: the timer may have just taken it out."""
+        with self.lock:
+            self.closed = True
+            if self.timer:
+                self.timer.cancel()
+            to_ui(type="work", active=False, who="agent")
+
+
+def finish_speaking(stream, reply, utterance):
+    """Speaks what is left of the reply and, once the voice is done, tells the bridge that
+    message `utterance` has had its reply."""
+    stream.finish(reply)
+    to_ui(type="spoken", utterance=utterance)
+
+
+def reply_turn(claude, text, by_voice, utterance, started=None):
+    """One turn of the session that talks, from the screen to the voice. `text` is the person's
+    message, or None for a turn the session began by itself, whose first event is `started`."""
+    to_ui(type="face", name="focused")
+    stream = ReplyStream(by_voice and read_pairs(VOICE).get("reply_by_voice") != "no")
+    laptop = Laptop()
+
+    def on_tool():
+        stream.tool()
+        laptop.tool()
+
+    reply, error = claude.turn(text, stream.add, on_tool, started)
+    laptop.close()
+    if error:
+        print(f"mangos-agent: {error}", file=sys.stderr, flush=True)
+        to_ui(type="face", name="sorry")
+        to_ui(type="say", text=failure_phrase(error, "Non ci sono riuscito."))
+        if by_voice:
+            finish_speaking(stream, None, utterance)
+        return
+    # The face the model chose during the turn stays: the bridge ignores this one unless it is
+    # still "focused".
+    to_ui(type="face", name="neutral", after="focused")
+    if by_voice:
+        # In a voice conversation the bridge reopens the mic when told the reply is done:
+        # after speaking it, if it is spoken, otherwise at once.
+        threading.Thread(target=finish_speaking, args=(stream, reply, utterance), daemon=True).start()
+    else:
+        stream.finish(reply)
+    # Spoken, the screen follows the voice by itself: showing the whole reply now would run ahead.
+    if reply and not stream.voiced:
+        if len(reply) > MAX_LINE:
+            reply = reply[:MAX_LINE - 1].rstrip() + "…"
+        to_ui(type="say", text=reply)
+
+
+def poll_person(inbox, wanted):
+    """Takes the person's messages from the bridge, one at a time, when the main loop is free
+    for one (`wanted`). A None in `inbox` says the bridge had nothing: an idle moment. It is the
+    only way messages arrive, so no error ends it: it logs and tries again."""
+    while True:
+        wanted.wait()
+        try:
+            message = call_bridge("/user")
+        except Exception as error:
+            print(f"mangos-agent: bridge not answering: {error}", file=sys.stderr, flush=True)
+            time.sleep(3)
+            continue
+        if message:
+            wanted.clear()
+        inbox.put(message)
+
+
+def next_work(claude, inbox):
+    """Waits for what comes first: a message from the person, (message, None), or a turn the
+    session begins by itself because another session wrote to it, (None, its first event). If
+    the session died while idle, it starts it again: the others write to it."""
+    while True:
+        try:
+            return inbox.get(timeout=0.1), None
+        except queue.Empty:
+            pass
+        if claude.alive():
+            event = claude.next_event(0)
+            if isinstance(event, dict) and starts_turn(event):
+                return None, event
+            if event == "closed":
+                print(f"mangos-agent: {claude.name}'s Claude Code exited, restarting it", file=sys.stderr, flush=True)
+                time.sleep(5)
+                try:
+                    claude.start()
+                except OSError as error:
+                    print(f"mangos-agent: Claude Code failed to start: {error}", file=sys.stderr, flush=True)
+
+
+def hold_mic():
+    """Asks the bridge to close the mic while the entity speaks without being spoken to.
+    Returns the number to give back with "spoken" once done, None if no voice conversation is
+    open."""
+    try:
+        return (call_bridge("/command", {"type": "voice_hold"}) or {}).get("utterance")
+    except OSError as error:
+        print(f"mangos-agent: bridge not answering (voice_hold): {error}", file=sys.stderr, flush=True)
+        return None
+
+
+def worker_main(claude):
+    """The worker: a second Claude Code with nobody in front of it. It waits for the jobs that
+    the session that talks sends it; what it writes goes only to the log."""
+    while True:
+        if not claude.alive():
+            try:
+                claude.start()
+            except OSError as error:
+                print(f"mangos-agent: worker failed to start: {error}", flush=True)
+                time.sleep(10)
+                continue
+            # A first message, so that the session is open and the one that talks can find it.
+            _, error = claude.turn(WORKER_STARTED)
+            print(f"mangos-agent: worker {'not ready: ' + error if error else 'ready'}", flush=True)
+        event = claude.next_event(30)
+        if event is None:
+            claude.summarize_if_needed()
+        elif event == "closed":
+            print("mangos-agent: the worker's Claude Code exited, restarting it", flush=True)
+            time.sleep(5)
+        elif starts_turn(event):
+            # While the worker works the entity sits at the laptop: to the person it is one
+            # entity, and the job is not over just because the one that talks has answered.
+            to_ui(type="work", active=True, who="worker")
+            try:
+                reply, error = claude.turn(None, started=event)
+            finally:
+                to_ui(type="work", active=False, who="worker")
+            if error:
+                print(f"mangos-agent: worker turn failed: {error}", flush=True)
+                to_ui(type="face", name="sorry")
+                to_ui(type="say", text=failure_phrase(error, "Il lavoro non è riuscito."))
+            else:
+                print(f"mangos-agent: worker turn done: {reply[:300]}", flush=True)
+
+
+def supervised(target, *args):
+    """Runs `target` for ever in a thread: an error is logged and it starts again."""
+    while True:
+        try:
+            target(*args)
+        except Exception:
+            traceback.print_exc()
+        time.sleep(5)
+
+
+def main():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    entity = read_pairs(ENTITY)
+    two = entity.get("agents") == "2"
+    # A laptop left up by a run that died mid-turn.
+    for who in ("agent", "worker"):
+        to_ui(type="work", active=False, who=who)
+    claude = Claude("talker" if two else "solo", entity.get("model", "haiku"))
+    if two:
+        worker = Claude("worker", entity.get("worker_model", "sonnet"))
+        threading.Thread(target=supervised, args=(worker_main, worker), daemon=True).start()
+    # Claude Code starts now, not at the first message: starting it takes a few seconds, and
+    # whoever writes first must not pay for it. If it does not start, the first turn will say so.
+    try:
+        claude.start()
+    except OSError as error:
+        print(f"mangos-agent: Claude Code failed to start: {error}", file=sys.stderr, flush=True)
+    inbox, wanted = queue.Queue(), threading.Event()
+    threading.Thread(target=poll_person, args=(inbox, wanted), daemon=True).start()
+    while True:
+        wanted.set()
+        message, started = next_work(claude, inbox)
+        if started is not None:
+            # Spoken only if the person is in a voice conversation now, whatever they did last.
+            utterance = hold_mic()
+            reply_turn(claude, None, utterance is not None, utterance, started)
+            continue
+        if not message:
+            claude.summarize_if_needed()
+            continue
+        text, by_voice = message["text"], bool(message.get("by_voice"))
+        if not text.startswith(SYSTEM_PREFIX):
+            to_ui(type="heard", text=text)
+        reply_turn(claude, ("(spoken) " if by_voice else "") + text, by_voice, message.get("utterance"))
+        claude.summarize_if_needed()    # the reply is given: if the conversation is huge, now
+
+
+if __name__ == "__main__":
+    main()

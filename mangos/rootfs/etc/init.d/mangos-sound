@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+# mangOS sound: takes the mix of everything that plays to the speaker (mangos-sound).
+
+description="Sound mixer to the speaker"
+supervisor=supervise-daemon
+command=/usr/bin/mangos-sound
+output_log=/var/log/mangos-sound.log
+error_log=/var/log/mangos-sound.log
+respawn_delay=3
+respawn_max=0
+
+start_pre() {
+	# The virtual card the mix goes through, with room for several players at once.
+	modprobe snd-aloop pcm_substreams=4
+}

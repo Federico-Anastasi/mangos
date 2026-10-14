@@ -1,0 +1,1193 @@
+#!/usr/bin/env python3
+"""mangos-bridge: the bridge between the screen, the keys and the agent.
+
+One program, listening only on the phone itself (127.0.0.1:8098). Its access points:
+
+  GET  /            the UI (the files in /usr/share/mangos/web); /fonts/, /surfaces/, /house-files/
+                    and /photos/ serve the fonts, the entity's pages, the room's objects and the photos
+  GET  /status      battery, Wi-Fi, volume, entity name and color, whether the worker is working,
+                    the space on the disk and what photos, pages, logs and conversations take of
+                    it, machine sensors, as JSON
+  GET  /sensors     acceleration and magnetic field, for the pages
+  GET  /camera.jpg  what the camera is seeing, during the preview
+  GET  /events      event stream to the UI (Server-Sent Events)
+  GET  /pages       the pages made by the entity, newest first
+  GET  /house       how the room is furnished: wall color and objects
+  GET  /user        the person's next message (waits a while, then answers 204)
+  POST /user        a message from the person to the entity, typed or spoken
+  POST /command     a command for the UI, as JSON: it is what the `pim` command uses
+  POST /voice       opens the voice conversation (mic, transcription, delivery to the entity, and the
+                    mic again after each reply), or closes the open one. "once": a single phrase;
+                    "greet": the entity first says it is there
+  POST /device      what a page asks of the phone, or `pim vibrate`: {"action": "vibrate" | "speak" |
+                    "photo", ...}; one request per action at a time
+  POST /house       changes the furnishing (action: walls, put, remove)
+  POST /metrics     the frames per second the UI manages to draw
+
+The entity's pages run in the browser and must not be able to command the phone: POSTs with an
+Origin header different from the UI's and GET /user requests carrying Sec-Fetch-Site (only a
+browser sends it) are rejected. A page can only ask through the UI (mangos.js).
+
+It also reads keys and touchscreen: the power key turns the screen off and on, and the screen
+turns itself off when nothing happens any more; with the screen off the UI stops drawing. When the
+disk is nearly full it tells the entity once, with a message that starts with "(mangOS)".
+
+The entity's name and color are in /etc/mangos/entity (lines name=... and color=...).
+"""
+import fcntl
+import glob
+import html
+import json
+import mimetypes
+import os
+import queue
+import random
+import re
+import select
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+WEB = "/usr/share/mangos/web"
+FONTS = "/usr/share/mangos/fonts"
+SURFACES = "/var/lib/mangos/surfaces"
+SURFACE_MODES = SURFACES + "/.modes.json"   # how each page was last shown, to reopen it the same way
+# Said when the entity is tapped, before it listens: never the same twice in a row.
+GREETINGS = ("Ci sono, dimmi tutto.", "Eccomi, dimmi.", "Sì? Ti ascolto.", "Dimmi pure.", "Sono qui, dimmi.")
+HOUSE_FILE = "/var/lib/mangos/house.json"
+HOUSE_FILES = "/var/lib/mangos/house"
+ENTITY = "/etc/mangos/entity"
+SETTINGS = "/var/lib/mangos/settings"
+BATTERY = "/sys/class/power_supply/sm5714-battery"
+BACKLIGHT = "/sys/class/backlight/s2dps01/brightness"
+GPU = "/sys/devices/platform/acpm-gpu"
+SPEAKER = "/dev/abox-speaker"
+ABOX_COMMAND = "/sys/kernel/debug/abox/command"
+SPEAK_SOCKET = "/run/mangos-speak.sock"
+CAMERA = "/run/mangos/camera.jpg"
+MOTION_SENSORS = "/sys/kernel/debug/chub/status"
+SENSOR_COMMAND = "/sys/kernel/debug/chub/command"
+PHOTOS = "/var/lib/mangos/photos"
+# What takes space on the disk, measured every DISK_CHECK_S; above DISK_FULL_PERCENT the entity is told.
+DISK_FOLDERS = {"photos": PHOTOS, "pages": SURFACES, "logs": "/var/log", "conversations": "/home/pim/.claude"}
+DISK_CHECK_S = 600
+DISK_FULL_PERCENT = 90
+SYSTEM_PREFIX = "(mangOS)"          # starts the messages for the entity that do not come from the person
+# Motion sensors for pages (games): while a page reads them they sample every FAST_MS, and go back
+# to SLOW_MS once nobody has read them for SENSORS_IDLE_S.
+FAST_MS, SLOW_MS, SENSORS_IDLE_S = 20, 100, 3
+PORT = 8098
+ORIGIN = f"http://127.0.0.1:{PORT}"
+BRIGHTNESS = 96
+# The screen turns off after this long without touches, and only if nobody is typing or
+# speaking, the entity is not working and the camera is closed.
+SCREEN_OFF_AFTER_S = 120
+# Powered off with the cable plugged in, the power chip does not cut the power and the phone
+# reboots. Whoever asks for the power-off leaves this marker: if at boot the marker and the
+# cable are both there, the UI shows only the charging battery until the side key is pressed.
+POWERED_OFF = "/var/lib/mangos/powered-off"
+CABLE = "/sys/class/power_supply/sm5714-usb/online"
+SHOW_CHARGE_S = 8                   # how long the screen stays on per key press while off-charging
+VOLUME_STEP = 6                     # volume change (0 to 100) per key press
+AGENT_WAIT_S = 25                   # how long GET /user waits for a message
+MAX_WORK_S = 900                    # beyond this the agent is no longer considered working
+PAGE_STUCK_S = 60                   # screen on and no metrics from the page for this long: it is stuck
+
+# Amplifier volume register: half a decibel per step, higher number = quieter.
+REGISTER_FULL, REGISTER_MIN = 0x31, 0xa7
+
+# Vibration motor: a fixed-voltage regulator, so it is on or off. The effect is an ioctl
+# EVIOCSFF with a struct ff_effect, which on arm64 is 48 bytes long.
+FF_RUMBLE, EV_FF = 0x50, 0x15
+EVIOCSFF = (1 << 30) | (48 << 16) | (ord("E") << 8) | 0x80
+MAX_VIBRATION_MS = 2000
+
+# struct input_event on arm64: two 64-bit integers for the time, then type, code, value.
+INPUT_EVENT = struct.Struct("qqHHi")
+EV_KEY, KEY_VOLUMEDOWN, KEY_VOLUMEUP, KEY_POWER = 1, 114, 115, 116
+
+# The events a client connecting to the UI later must receive at once, the last of each type.
+STATE_EVENTS = ("screen", "off_charging", "say", "face", "surface", "voice")
+
+
+def log(text):
+    print(time.strftime("%d/%m %H:%M:%S ") + "mangos-bridge: " + text, file=sys.stderr, flush=True)
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def read_pairs(path):
+    """Reads a file of key=value lines; lines starting with # are comments."""
+    values = {}
+    for line in (read_file(path) or "").splitlines():
+        key, equals, value = line.partition("=")
+        if equals and not key.lstrip().startswith("#"):
+            values[key.strip()] = value.strip()
+    return values
+
+
+def write_atomic(path, text):
+    """Writes a whole file or nothing: a reader never sees half of it."""
+    with open(path + ".new", "w") as f:
+        f.write(text)
+    os.replace(path + ".new", path)
+
+
+class Events:
+    """What the UI must know: events reach it as they happen, and a client connecting later
+    immediately receives the current state."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.queues = []
+        self.current = {}
+
+    def send(self, event):
+        with self.lock:
+            if event.get("type") in STATE_EVENTS:
+                self.current[event["type"]] = event
+            for events_queue in self.queues:
+                events_queue.put(event)
+
+    def connect(self):
+        events_queue = queue.Queue()
+        with self.lock:
+            for event in self.current.values():
+                events_queue.put(event)
+            self.queues.append(events_queue)
+        return events_queue
+
+    def disconnect(self, events_queue):
+        with self.lock:
+            self.queues.remove(events_queue)
+
+
+events = Events()
+metrics = {}                        # what the UI measures about itself, with the time it said so
+
+
+class Agent:
+    """The messages for the agent, which takes them one at a time with GET /user. From taking
+    one to asking for another it is working."""
+
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.since = None           # when it took the last message; None if it is free
+
+    def busy(self):
+        return self.since is not None and time.monotonic() - self.since < MAX_WORK_S
+
+    def tell(self, text):
+        """A message from the system: it goes through the queue of the person's, marked."""
+        self.queue.put({"type": "text", "text": f"{SYSTEM_PREFIX} {text}"})
+
+
+agent = Agent()
+working = set()             # who has the laptop up: "agent" or "worker"
+
+
+def gpu(full):
+    """GPU frequency: the highest with the screen on, the lowest with the screen off, when
+    nothing is drawn."""
+    allowed = (read_file(GPU + "/allowed_khz") or "").split()      # highest first
+    if not allowed:
+        log("GPU frequency not adjustable (acpm_gpu module missing): it stays at the bootloader's")
+        return
+    try:
+        with open(GPU + "/khz", "w") as f:
+            f.write(allowed[0] if full else allowed[-1])
+    except OSError as error:
+        log(f"GPU frequency not set: {error}")
+
+
+def speak_request(request, timeout):
+    """Asks the voice service (mangos-speak --service) for something and waits for its reply, the
+    result code of the speech. Raises OSError if the service does not answer."""
+    with socket.socket(socket.AF_UNIX) as service:
+        service.settimeout(timeout)
+        service.connect(SPEAK_SOCKET)
+        service.sendall(json.dumps(request).encode() + b"\n")
+        line = service.makefile().readline()
+    try:
+        return int(line)
+    except ValueError:
+        raise ConnectionError(f"unexpected reply from the voice service: {line!r}") from None
+
+
+class VoiceConversation:
+    """The voice conversation. A tap on the mic opens it: the mic is piped to mangos-transcribe,
+    which cuts the phrase, transcribes it and delivers it; when the entity has finished replying
+    the mic reopens by itself. It closes with another tap, or by itself if nobody speaks or the
+    reply does not arrive."""
+
+    LISTEN = "mangos-mic | mangos-transcribe listen --send"
+    REPLY_WAIT_S = 180
+    NO_SPEECH_EXIT = 3              # mangos-transcribe exit code when there was no speech
+    # The other exit codes of mangos-transcribe that the person must be told apart.
+    FAILURES = {4: "Non c'è rete: non riesco ad ascoltarti.",
+                5: "La chiave di Deepgram manca o è rifiutata.",
+                6: "Il microfono non è disponibile."}
+
+    def __init__(self):
+        self.lock = threading.Lock()            # held while the conversation is open
+        self.closing = threading.Event()
+        self.spoken = threading.Event()         # the entity has finished replying
+        self.listener = None                    # the listening process, if any
+        self.count = 0                          # how many spoken messages have arrived
+        self.awaiting = 0                       # the message whose reply is awaited, 0 if none
+        self.held = False                       # the entity speaks unasked: no listening meanwhile
+        self.greeting = None                    # the last greeting said
+
+    def toggle(self, once=False, greet=False):
+        """The tap on the mic: opens the conversation, or closes the open one. The tap on the
+        entity opens it `once` (one phrase, then the mic stays closed until the next tap) and with
+        `greet`: first the entity says it is there."""
+        if self.lock.locked():
+            self.closing.set()
+            self.spoken.set()                   # wakes whoever waits for the reply
+            listener = self.listener
+            if listener and listener.poll() is None:
+                os.killpg(listener.pid, signal.SIGTERM)
+            return
+        if not self.lock.acquire(blocking=False):
+            return                              # two simultaneous taps: one is enough
+        self.closing.clear()
+        threading.Thread(target=self.converse, args=(once, greet), daemon=True).start()
+
+    def greet(self):
+        """A short phrase saying the entity is listening, never the same twice in a row, made
+        once by the voice service and then played at once; the mic opens when it is over."""
+        self.silence()
+        self.greeting = random.choice([g for g in GREETINGS if g != self.greeting])
+        events.send({"type": "say", "text": self.greeting})
+        try:
+            speak_request({"text": self.greeting, "cache": True}, 20)
+        except OSError as error:
+            log(f"greeting not spoken: {error}")
+
+    def new_utterance(self):
+        """A spoken message arrives. Returns the number with which the agent, once the reply is
+        done, says which message it was answering."""
+        self.count += 1
+        self.awaiting = self.count
+        return self.count
+
+    def hold(self):
+        """The entity is about to speak without being spoken to (with two agents: the worker's
+        news). The mic must not hear it: the listening in progress stops, and the conversation
+        waits for "spoken" with the returned number before listening again. None if no
+        conversation is open."""
+        if not self.lock.locked():
+            return None
+        self.held = True                        # first: the loop must not reset what follows
+        utterance = self.new_utterance()
+        self.spoken.clear()
+        listener = self.listener
+        if listener and listener.poll() is None:
+            os.killpg(listener.pid, signal.SIGTERM)
+        events.send({"type": "voice", "state": "done"})     # the mic stops pulsing: the entity speaks
+        return utterance
+
+    def silence(self):
+        """Makes the entity stop talking: otherwise the mic would hear it."""
+        try:
+            speak_request({"stop": True}, 10)
+        except FileNotFoundError:
+            pass                                # no voice service: nobody is talking
+        except OSError as error:
+            log(f"voice not silenced: {error}")
+
+    def listen_phrase(self):
+        """Listens for one phrase and has it delivered. True if somebody spoke."""
+        if self.held:
+            return False
+        self.silence()
+        if self.held:                           # the entity began to speak meanwhile
+            return False
+        # In its own group: closing the conversation stops mic and transcription together.
+        self.listener = subprocess.Popen(["sh", "-c", self.LISTEN], stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.PIPE, text=True, start_new_session=True)
+        if self.held:                           # hold() ran before the listener was set: it stops it now
+            os.killpg(self.listener.pid, signal.SIGTERM)
+        try:
+            _, errors = self.listener.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            os.killpg(self.listener.pid, signal.SIGKILL)
+            self.listener.communicate()
+            events.send({"type": "voice", "state": "failed", "text": "Ho smesso di ascoltare: troppo tempo."})
+            return False
+        if self.closing.is_set() or self.held:
+            return False
+        code = self.listener.returncode
+        # If nobody spoke mangos-transcribe has already told the UI; anything else is a failure.
+        if code not in (0, self.NO_SPEECH_EXIT):
+            log("listening failed: " + errors.strip()[-300:])
+            events.send({"type": "voice", "state": "failed",
+                         "text": self.FAILURES.get(code, "Non sono riuscito ad ascoltare.")})
+        return code == 0
+
+    def converse(self, once=False, greet=False):
+        try:
+            events.send({"type": "voice", "state": "open"})
+            if greet:
+                self.greet()
+            while not self.closing.is_set():
+                if not self.held:
+                    self.awaiting = 0           # the reply to the previous phrase no longer matters
+                    self.spoken.clear()
+                heard = self.listen_phrase()
+                if self.held:
+                    # The entity speaks unasked: listen again once it has finished.
+                    if not self.spoken.wait(self.REPLY_WAIT_S):
+                        break
+                    self.held = False
+                    continue
+                if not heard or once:
+                    break
+                # The phrase went to the entity: the mic reopens when it has finished replying.
+                if not self.spoken.wait(self.REPLY_WAIT_S):
+                    break
+            if self.closing.is_set():
+                self.silence()
+        finally:
+            self.listener = None
+            events.send({"type": "voice", "state": "closed"})
+            self.lock.release()
+
+
+voice = VoiceConversation()
+
+
+class Volume:
+    """The speaker volume, 0 to 100: the keys change it, it persists across boots (in
+    /var/lib/mangos/settings) and it is written to the amplifier's register: 100 is its full
+    power, every 10 less is about 6 decibels less. It applies to everything that plays."""
+
+    def __init__(self):
+        try:
+            self.level = max(0, min(100, int(read_pairs(SETTINGS).get("volume", ""))))
+        except ValueError:
+            self.level = 70
+        self.node_ctime = None      # when the speaker node it was applied to was created
+        self.retries = 0            # attempts left to apply it to that speaker
+
+    def follow(self):
+        """Applies the volume to the speaker as soon as it appears: at boot, and every time the
+        audio module is reloaded, because the amplifier restarts from the module's volume, not
+        ours. The amplifier answers only once the module is fully up: retried every second for
+        a while."""
+        try:
+            node_ctime = os.stat(SPEAKER).st_ctime_ns
+        except FileNotFoundError:
+            return
+        if node_ctime != self.node_ctime:
+            self.node_ctime, self.retries = node_ctime, 30
+        if self.retries:
+            self.retries -= 1
+            error = self.apply()
+            if error and not self.retries:
+                log(f"volume not applied to the speaker: {error}")
+
+    def apply(self):
+        """Writes the volume to the amplifier. Returns the error, or None."""
+        register = REGISTER_MIN - (REGISTER_MIN - REGISTER_FULL) * self.level // 100
+        try:
+            with open(ABOX_COMMAND, "w") as f:
+                f.write(f"volume {register}")
+        except OSError as error:
+            return f"{error.strerror}: is the abox module loaded?"
+        self.retries = 0
+        return None
+
+    def set_level(self, level):
+        """Changes the volume, remembers it and shows it. Returns the error, if the speaker is missing."""
+        self.level = max(0, min(100, level))
+        try:
+            write_atomic(SETTINGS, f"volume={self.level}\n")
+        except OSError as error:
+            log(f"volume not saved: {error}")
+        error = self.apply()
+        events.send({"type": "volume", "level": self.level})
+        return error
+
+
+volume = Volume()
+
+
+class Screen:
+    """Backlight: on, off, and the time of the last activity. `off_charging` is true while the
+    phone acts as powered off and charging."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.on = read_file(BACKLIGHT) != "0"   # a restarted bridge finds the screen as it was left
+        self.auto_off = False       # turns itself off: only if there are keys to turn it back on
+        self.metrics_since = time.monotonic() if self.on else None   # since when the page must say it draws
+        self.off_charging = os.path.exists(POWERED_OFF) and read_file(CABLE) == "1"
+        if not self.off_charging:
+            self.forget_poweroff()          # turned on with the key, cable unplugged: a real power-on
+        self.last_touch = time.monotonic()
+        gpu(self.on)
+
+    def keep_awake(self):
+        """Something is happening: the countdown to screen-off restarts."""
+        self.last_touch = time.monotonic()
+
+    def set_on(self, on, cause=""):
+        """Turns on or off; `cause` says why it turns off, and goes in the log."""
+        with self.lock:
+            self.keep_awake()
+            if on == self.on:
+                return
+            self.on = on
+            self.metrics_since = time.monotonic() if on else None
+            if not on:
+                log(f"screen off: {cause}")
+            gpu(on)
+            try:
+                with open(BACKLIGHT, "w") as f:
+                    f.write(str(BRIGHTNESS) if on else "0")
+            except OSError as error:
+                log(f"backlight not set: {error}")
+            events.send({"type": "screen", "on": on})
+
+    def page_alive(self):
+        """The page said it is drawing."""
+        self.metrics_since = time.monotonic()
+
+    def page_stuck(self):
+        """True, once, if the screen is on and the page no longer says it draws."""
+        with self.lock:
+            stuck = (self.on and self.metrics_since is not None
+                     and time.monotonic() - self.metrics_since > PAGE_STUCK_S)
+            if stuck:
+                self.metrics_since = None
+            return stuck
+
+    @staticmethod
+    def forget_poweroff():
+        try:
+            os.unlink(POWERED_OFF)
+        except FileNotFoundError:
+            pass
+
+    def power_on(self):
+        """End of off-charging: the real UI returns."""
+        with self.lock:
+            self.off_charging = False
+            self.forget_poweroff()
+            events.send({"type": "off_charging", "active": False})
+            self.on = False                 # so set_on() turns it on and the countdown restarts
+            self.set_on(True)
+
+    def power_off(self):
+        """Powers the phone off. With the cable plugged in it reboots and shows the charging battery."""
+        with open(POWERED_OFF, "w") as f:
+            f.write("powered off on request\n")
+        os.sync()
+        subprocess.Popen(["poweroff"])
+
+
+screen = Screen()
+
+
+def input_devices():
+    """Paths of the input devices: (touchscreen, [keys])."""
+    touch, keys, name = None, [], ""
+    for line in (read_file("/proc/bus/input/devices") or "").splitlines():
+        if line.startswith("N: Name="):
+            name = line
+        elif line.startswith("H: Handlers="):
+            event = next((p for p in line.split() if p.startswith("event")), None)
+            if not event:
+                continue
+            if "Touchscreen" in name:
+                touch = "/dev/input/" + event
+            elif "keys" in name or "pwrkey" in name:
+                keys.append("/dev/input/" + event)
+    return touch, keys
+
+
+def supervised(round_fn, *args):
+    """Repeats `round_fn` until it returns False. An error is logged and retried; if it happens
+    ten times in a row the bridge exits, and supervise-daemon relaunches it: better to restart
+    than to be left without keys."""
+    failures = 0
+    while True:
+        try:
+            if round_fn(*args) is False:
+                return
+            failures = 0
+        except Exception:
+            failures += 1
+            log("error, retrying:\n" + traceback.format_exc())
+            if failures == 10:
+                os._exit(1)
+            time.sleep(1)
+
+
+def handle_key(code, repeated):
+    """A key pressed; `repeated` if it is held down, and then it only counts for the volume."""
+    if repeated and (code == KEY_POWER or screen.off_charging or not screen.on):
+        return
+    if screen.off_charging:
+        # The side key turns on; the volume keys show the battery again.
+        if code == KEY_POWER:
+            screen.power_on()
+        else:
+            screen.set_on(True)
+    elif code == KEY_POWER:
+        screen.set_on(not screen.on, "power key")
+    elif code in (KEY_VOLUMEDOWN, KEY_VOLUMEUP):
+        if not screen.on:
+            screen.set_on(True)
+            return
+        screen.keep_awake()
+        error = volume.set_level(volume.level + (VOLUME_STEP if code == KEY_VOLUMEUP else -VOLUME_STEP))
+        if error:
+            log(f"volume not applied: {error}")
+
+
+def input_round(opened, touch):
+    ready, _, _ = select.select(list(opened), [], [], 1.0)
+    for fd in ready:
+        try:
+            data = os.read(fd, INPUT_EVENT.size * 64)
+        except BlockingIOError:
+            continue
+        if opened[fd] == touch:
+            if screen.on and not screen.off_charging:
+                screen.keep_awake()
+            continue
+        for start in range(0, len(data) - INPUT_EVENT.size + 1, INPUT_EVENT.size):
+            _, _, ev_type, code, value = INPUT_EVENT.unpack_from(data, start)
+            # 1 is the press, 2 the repeat while held.
+            if ev_type == EV_KEY and value in (1, 2):
+                handle_key(code, value == 2)
+
+
+def inputs():
+    """Reads keys and touchscreen."""
+    touch, keys = input_devices()
+    opened = {}
+    for path in ([touch] if touch else []) + keys:
+        try:
+            opened[os.open(path, os.O_RDONLY | os.O_NONBLOCK)] = path
+        except OSError as error:
+            log(f"{path} not opened: {error}")
+    if not opened:
+        log("no keys or touchscreen: the screen stays on")
+        return
+    screen.auto_off = True
+    supervised(input_round, opened, touch)
+
+
+def time_round():
+    time.sleep(1)
+    volume.follow()
+    if screen.off_charging and read_file(CABLE) == "0":
+        log("cable unplugged while powered off: powering the phone off")
+        subprocess.Popen(["poweroff"])
+        return False
+    # With a voice conversation open, or the agent working on a message, it stays on.
+    if not screen.off_charging and (voice.lock.locked() or agent.busy()):
+        screen.keep_awake()
+    idle = time.monotonic() - screen.last_touch
+    if screen.auto_off and screen.on and idle > (SHOW_CHARGE_S if screen.off_charging else SCREEN_OFF_AFTER_S):
+        screen.set_on(False, f"no activity for {idle:.0f} s")
+    if screen.page_stuck():
+        log(f"the page has not said it is drawing for {PAGE_STUCK_S} s: restarting mangos-web")
+        result = subprocess.run(["rc-service", "--ifstarted", "mangos-web", "restart"], capture_output=True,
+                                text=True, timeout=60)
+        if result.returncode:
+            log("restart of mangos-web failed: " + result.stderr.strip())
+
+
+def read_number(path, divisor=1):
+    """A number read from /sys, divided by `divisor`; None if it cannot be read."""
+    text = read_file(path)
+    try:
+        return round(int(text) / divisor, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def motion(text, sensor):
+    """The last sample of a motion sensor on the three axes (accelerometer in m/s², compass in
+    microtesla), from the status text of the chub module; None if the sensors are not started."""
+    found = re.search(sensor + r", last sample in thousandths.*?: x (-?\d+) y (-?\d+) z (-?\d+)", text)
+    return [int(v) / 1000 for v in found.groups()] if found else None
+
+
+class MotionForPages:
+    """The motion sensors read by a page: GET /sensors. The first reading speeds the sensors up;
+    a watcher slows them down again when the page stops asking."""
+
+    def __init__(self):
+        self.last = 0.0
+        self.fast = False
+        self.lock = threading.Lock()
+
+    def period(self, ms):
+        try:
+            for sensor in ("accel", "compass"):
+                with open(SENSOR_COMMAND, "w") as f:
+                    f.write(f"{sensor} 1 {ms}")
+        except OSError as error:
+            log(f"sensor period not changed: {error}")
+
+    def read(self):
+        with self.lock:
+            self.last = time.monotonic()
+            if not self.fast:
+                self.fast = True
+                self.period(FAST_MS)
+                threading.Thread(target=self.watch, daemon=True).start()
+        chub = read_file(MOTION_SENSORS) or ""
+        return {"acceleration": motion(chub, "accelerometer"), "magnetic_field": motion(chub, "compass")}
+
+    def watch(self):
+        while time.monotonic() - self.last < SENSORS_IDLE_S:
+            time.sleep(1)
+        with self.lock:
+            self.fast = False
+            self.period(SLOW_MS)
+
+
+motion_for_pages = MotionForPages()
+
+
+def vibrate(ms):
+    """Runs the vibration motor for `ms` milliseconds. Returns an error message, or None."""
+    for name_file in glob.glob("/sys/class/input/event*/device/name"):
+        if read_file(name_file) == "regulator-haptic":
+            node = "/dev/input/" + name_file.split("/")[4]
+            break
+    else:
+        return "the kernel has no vibration motor (regulator-haptic driver)"
+    try:
+        fd = os.open(node, os.O_RDWR)
+        try:
+            # struct ff_effect: type, id (-1: the kernel assigns it), direction, trigger (2 fields),
+            # duration and delay, then the effect: strength of the large and of the small motor.
+            effect = bytearray(struct.pack("<HhHHHHH2xHH28x", FF_RUMBLE, -1, 0, 0, 0, ms, 0, 0xFFFF, 0))
+            fcntl.ioctl(fd, EVIOCSFF, effect)
+            effect_id = struct.unpack_from("<h", effect, 2)[0]
+            os.write(fd, INPUT_EVENT.pack(0, 0, EV_FF, effect_id, 1))
+            time.sleep(ms / 1000 + 0.05)        # closing the device makes the kernel stop the effect
+        finally:
+            os.close(fd)
+    except OSError as error:
+        return f"the vibration motor failed ({error.strerror})"
+    return None
+
+
+def do_vibrate(body):
+    try:
+        ms = max(1, min(MAX_VIBRATION_MS, int(body.get("ms", 200))))
+    except (TypeError, ValueError):
+        return 400, {"error": "ms must be a number"}
+    error = vibrate(ms)
+    return (503, {"error": error}) if error else (200, {"ok": True})
+
+
+def do_speak(body):
+    text = str(body.get("text") or "").strip()[:500]
+    if not text:
+        return 400, {"error": "missing text"}
+    try:
+        speak_request({"text": text}, 120)
+    except OSError as error:
+        return 503, {"error": f"the voice does not answer ({error})"}
+    return 200, {"ok": True}
+
+
+def do_photo(body):
+    name = time.strftime("page-%Y%m%d-%H%M%S.jpg")
+    command = ["mangos-photo", "--preview", "3", "--long-side", "1280", "-o", f"{PHOTOS}/{name}"]
+    if body.get("front"):
+        command.insert(1, "--front")
+    result = subprocess.run(command, capture_output=True, text=True, timeout=40)
+    if result.returncode:
+        return 503, {"error": (result.stderr.strip() or "the camera did not answer")[-200:]}
+    return 200, {"url": "/photos/" + name}
+
+
+# What a page can ask of the phone, each one request at a time: a loop in a page must not pile up
+# processes and threads.
+DEVICE_ACTIONS = {"vibrate": (do_vibrate, threading.Lock()), "speak": (do_speak, threading.Lock()),
+                  "photo": (do_photo, threading.Lock())}
+
+
+def device(body):
+    """What a page asks of the phone through the UI (mangos.js), or `pim vibrate`: returns (code, reply)."""
+    action = body.get("action")
+    entry = DEVICE_ACTIONS.get(action) if isinstance(action, str) else None
+    if entry is None:
+        return 400, {"error": "unknown action"}
+    carry_out, busy = entry
+    if not busy.acquire(blocking=False):
+        return 429, {"error": "the previous request is still being carried out"}
+    try:
+        return carry_out(body)
+    finally:
+        busy.release()
+
+
+def sensors():
+    """What tells how the machine is doing: temperatures, frequencies, current, memory."""
+    temperatures = {}
+    for zone in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+        name = read_file(zone + "/type")
+        if name:
+            temperatures[name] = read_number(zone + "/temp", 1000)
+    free = next((int(line.split()[1]) // 1024 for line in (read_file("/proc/meminfo") or "").splitlines()
+                 if line.startswith("MemAvailable:")), None)
+    chub = read_file(MOTION_SENSORS) or ""
+    return {
+        "temperatures": temperatures,                     # degrees
+        "cpu_mhz": [read_number(group + "/scaling_cur_freq", 1000)
+                    for group in sorted(glob.glob("/sys/devices/system/cpu/cpufreq/policy*"))],
+        "gpu_mhz": read_number(GPU + "/khz", 1000),
+        "acceleration": motion(chub, "accelerometer"),          # m/s² on the three axes
+        "magnetic_field": motion(chub, "compass"),              # microtesla on the three axes, uncalibrated
+        "load": (read_file("/proc/loadavg") or "").split()[:3],
+        "current_ma": read_number(BATTERY + "/current_now", 1000),   # negative: the battery is discharging
+        "free_memory_mb": free,
+        # The UI says it every five seconds; with the screen off it does not draw and is absent.
+        "fps": metrics.get("fps") if time.monotonic() - metrics.get("at", -1e9) < 12 else None,
+    }
+
+
+def folder_bytes(path):
+    """The space a folder takes on the disk, everything inside it included."""
+    total, pending = 0, [path]
+    while pending:
+        try:
+            entries = list(os.scandir(pending.pop()))
+        except OSError:
+            continue                    # missing, or removed meanwhile
+        for entry in entries:
+            try:
+                total += entry.stat(follow_symlinks=False).st_blocks * 512
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(entry.path)
+            except OSError:
+                pass                    # removed meanwhile
+    return total
+
+
+def size_text(size):
+    return f"{size / 2**30:.1f} GB" if size >= 2**30 else f"{size >> 20} MB"
+
+
+class Disk:
+    """The system disk. Free space is read on request; what each folder takes is measured every
+    DISK_CHECK_S, because walking them at every request would be slow. Above DISK_FULL_PERCENT the
+    entity is told once; it is told again only if the disk goes below and then rises again."""
+
+    def __init__(self):
+        self.weights = {}               # bytes taken by each of DISK_FOLDERS, at the last measurement
+        self.warned = False
+
+    @staticmethod
+    def space():
+        """(used, free, total) bytes of the system partition; free is what a program can still write."""
+        stat = os.statvfs("/")
+        total = stat.f_blocks * stat.f_frsize
+        return total - stat.f_bfree * stat.f_frsize, stat.f_bavail * stat.f_frsize, total
+
+    def summary(self):
+        used, free, total = self.space()
+        return {"free_mb": free >> 20, "total_mb": total >> 20, "used_percent": round(100 * used / (used + free)),
+                **{f"{name}_mb": size >> 20 for name, size in self.weights.items()}}
+
+    def measure(self):
+        self.weights = {name: folder_bytes(path) for name, path in DISK_FOLDERS.items()}
+        used, free, _ = self.space()
+        percent = 100 * used / (used + free)
+        full = percent > DISK_FULL_PERCENT
+        if full and not self.warned:
+            details = ", ".join(f"{name} {size_text(size)}" for name, size in self.weights.items())
+            agent.tell(f"The disk is {percent:.0f}% full: {details}. Tell the person and propose what to "
+                       "remove; delete nothing without asking.")
+        self.warned = full
+
+
+disk = Disk()
+
+
+def disk_round():
+    disk.measure()
+    time.sleep(DISK_CHECK_S)
+
+
+def status():
+    entity = read_pairs(ENTITY)
+    capacity = read_file(BATTERY + "/capacity")
+    link = subprocess.run(["iw", "dev", "wlan0", "link"], capture_output=True, text=True, timeout=5).stdout
+    dbm = next((line.split()[1] for line in link.splitlines() if "signal:" in line), None)
+    return {
+        "battery": int(capacity) if capacity and capacity.isdigit() else None,
+        "charging": read_file(BATTERY + "/status") == "Charging",
+        "off_charging": screen.off_charging,
+        "volume": volume.level,
+        "working": "worker" in working,
+        "wifi": int(dbm) if dbm else None,
+        "disk": disk.summary(),
+        "name": entity.get("name", "mangOS"),
+        "color": entity.get("color", "blue"),
+        "sensors": sensors(),
+    }
+
+
+def surface_modes():
+    try:
+        with open(SURFACE_MODES) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def surface_name(url):
+    return url.split("?")[0].rsplit("/", 1)[-1]
+
+
+def remember_mode(url, mode):
+    """How a page was shown (window, background, full): the collection reopens it the same way."""
+    name = surface_name(url)
+    modes = surface_modes()
+    if modes.get(name) == mode:
+        return
+    modes[name] = mode
+    with open(SURFACE_MODES + ".part", "w") as f:
+        json.dump(modes, f)
+    os.replace(SURFACE_MODES + ".part", SURFACE_MODES)
+
+
+def page_title(name):
+    """The title written in a page of the entity (its file name if it has none), and when it was
+    last modified."""
+    path = os.path.join(SURFACES, name)
+    with open(path, encoding="utf-8", errors="replace") as f:
+        found = re.search(r"<title>(.*?)</title>", f.read(4096), re.S | re.I)
+    return html.unescape(found.group(1).strip()) if found else name, os.path.getmtime(path)
+
+
+def pages():
+    """The pages made by the entity: title, url, when, and how it was last shown."""
+    modes = surface_modes()
+    result = []
+    for name in os.listdir(SURFACES) if os.path.isdir(SURFACES) else []:
+        if not name.endswith(".html"):
+            continue
+        try:
+            title, modified = page_title(name)
+        except OSError:
+            continue                    # removed while listing
+        result.append({"title": title, "url": "/surfaces/" + name, "modified": modified,
+                       "mode": modes.get(name, "window"),
+                       "when": time.strftime("%d/%m alle %H:%M", time.localtime(modified))})
+    return sorted(result, key=lambda p: p["modified"], reverse=True)
+
+
+def house():
+    try:
+        with open(HOUSE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {"walls": "#1d1f24", "objects": []}
+
+
+house_lock = threading.Lock()
+
+
+def furnish(request):
+    """Applies a change to the furnishing. Returns an error message, or None."""
+    action = request.get("action")
+    with house_lock:
+        current = house()
+        current.setdefault("objects", [])
+        if action == "walls":
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(request.get("color"))):
+                return "color must be written as #rrggbb"
+            current["walls"] = request["color"]
+        elif action == "put":
+            obj = {k: request.get(k) for k in ("id", "file", "where", "x", "y", "near", "size", "room")}
+            if not obj["id"] or not os.path.isfile(os.path.join(HOUSE_FILES, str(obj["file"]))):
+                return "need an id and a file that exists in " + HOUSE_FILES
+            if obj["where"] not in ("wall", "left", "right", "floor"):
+                return "where: wall, left, right or floor"
+            if obj["room"] not in (None, 0, 1, 2, 3):
+                return "room: 0 to 3"
+            current["objects"] = [o for o in current["objects"] if o["id"] != obj["id"]] + [obj]
+        elif action == "remove":
+            current["objects"] = [o for o in current["objects"] if o["id"] != request.get("id")]
+        else:
+            return "action: walls, put or remove"
+        write_atomic(HOUSE_FILE, json.dumps(current, ensure_ascii=False, indent=1))
+    events.send({"type": "house"})
+    return None
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def reply(self, code, body=b"", content_type="application/json"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass                    # the client left before the reply
+
+    def client_present(self):
+        """False if the client has closed the connection."""
+        ready, _, _ = select.select([self.connection], [], [], 0)
+        try:
+            return not ready or bool(self.connection.recv(1, socket.MSG_PEEK))
+        except OSError:
+            return False
+
+    def deliver(self):
+        """GET /user: waits for a message for the agent and hands it over. If the agent leaves
+        while waiting (it is being restarted) nobody takes the message: it stays queued."""
+        agent.since = None
+        for _ in range(AGENT_WAIT_S):
+            if not self.client_present():
+                return
+            try:
+                message = agent.queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            if not self.client_present():
+                agent.queue.put(message)
+                return
+            agent.since = time.monotonic()
+            self.reply(200, message)
+            return
+        self.reply(204)
+
+    def do_GET(self):
+        route = self.path.split("?")[0].split("#")[0]
+        if route == "/status":
+            self.reply(200, status())
+        elif route == "/pages":
+            self.reply(200, pages())
+        elif route == "/house":
+            self.reply(200, house())
+        elif route == "/sensors":
+            self.reply(200, motion_for_pages.read())
+        elif route == "/events":
+            self.stream_events()
+        elif route == "/camera.jpg":
+            # Written by mangos-photo during the preview.
+            try:
+                with open(CAMERA, "rb") as f:
+                    self.reply(200, f.read(), "image/jpeg")
+            except OSError:
+                self.reply(404, {"error": "no preview"})
+        elif route == "/user":
+            if self.headers.get("Sec-Fetch-Site") is not None:
+                self.reply(403, {"error": "messages for the agent cannot be read from a browser"})
+            else:
+                self.deliver()
+        else:
+            self.serve_file(route)
+
+    def do_POST(self):
+        origin = self.headers.get("Origin")
+        if origin is not None and origin != ORIGIN:
+            self.close_connection = True        # the body is not read
+            self.reply(403, {"error": "origin not allowed"})
+            return
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            self.reply(400, {"error": "need a JSON object"})
+            return
+        if self.path == "/command":
+            self.handle_command(body)
+        elif self.path == "/user":
+            self.user_message(body)
+        elif self.path == "/voice":
+            voice.toggle(bool(body.get("once")), bool(body.get("greet")))
+            self.reply(200, {"ok": True})
+        elif self.path == "/metrics":
+            value = body.get("fps")
+            if not isinstance(value, (int, float)):
+                self.reply(400, {"error": "missing fps"})
+                return
+            metrics.update(fps=value, at=time.monotonic())
+            screen.page_alive()
+            if body.get("active"):
+                screen.keep_awake()     # the person is typing, or the camera is open
+            self.reply(200, {"ok": True})
+        elif self.path == "/device":
+            code, reply = device(body)
+            self.reply(code, reply)
+        elif self.path == "/house":
+            error = furnish(body)
+            self.reply(400 if error else 200, {"error": error} if error else house())
+        else:
+            self.reply(404, {"error": "unknown address"})
+
+    def user_message(self, body):
+        """A message from the person for the agent."""
+        text = body.get("text")
+        if body.get("type") != "text" or not isinstance(text, str) or not text.strip():
+            self.reply(400, {"error": 'need {"type": "text", "text": "..."}'})
+            return
+        screen.keep_awake()
+        if body.get("by_voice"):
+            body["utterance"] = voice.new_utterance()
+        # The agent handles one at a time: someone speaking while it works must see that the
+        # message arrived and is waiting, not be left without a reply.
+        if agent.busy() or not agent.queue.empty():
+            events.send({"type": "queued", "text": text})
+        agent.queue.put(body)
+        self.reply(200, {"ok": True})
+
+    def handle_command(self, body):
+        event_type = body.get("type")
+        if event_type is None:
+            self.reply(400, {"error": "missing field type"})
+            return
+        if event_type == "screen":
+            screen.set_on(bool(body.get("on")), "command")
+        elif event_type == "volume":
+            try:
+                level = int(body.get("level"))
+            except (TypeError, ValueError):
+                self.reply(400, {"error": "level must be a number from 0 to 100"})
+                return
+            error = volume.set_level(level)
+            self.reply(503 if error else 200, {"error": error} if error else {"ok": True})
+            return
+        elif event_type == "poweroff":
+            self.reply(200, {"ok": True})
+            screen.power_off()
+            return
+        elif event_type == "poweron":
+            if screen.off_charging:
+                screen.power_on()
+        elif event_type == "spoken":
+            if body.get("utterance") == voice.awaiting:
+                voice.spoken.set()          # the entity has finished replying to whoever spoke to it
+        elif event_type == "voice_hold":
+            self.reply(200, {"utterance": voice.hold()})
+            return
+        elif event_type == "work":
+            # The laptop stays up while anyone works: the agent's turn, and the worker (with two
+            # agents the person must see one entity at work until the worker is done).
+            who = body.get("who")
+            if not isinstance(who, str) or not who:
+                self.reply(400, {"error": "missing field who"})
+                return
+            if body.get("active"):
+                working.add(who)
+            else:
+                working.discard(who)
+            screen.keep_awake()
+            events.send({"type": "work", "active": bool(working)})
+        else:
+            # A face sent only to undo another ("after") is dropped if the entity has since chosen
+            # its own: the face it chose stays until the next message.
+            after = body.pop("after", None)
+            if after and (events.current.get("face") or {}).get("name") != after:
+                self.reply(200, {"ok": True})
+                return
+            # What the entity shows (a reply, the camera, a page) turns the screen on; the rest
+            # (faces, gestures, a page closing) only keeps it on if it already is.
+            shows = event_type in ("say", "camera") or (event_type == "surface" and body.get("url"))
+            if event_type == "surface" and body.get("url"):
+                try:
+                    remember_mode(str(body["url"]), str(body.get("mode") or "window"))
+                    if not body.get("title"):
+                        body["title"] = page_title(surface_name(str(body["url"])))[0]
+                except OSError as error:
+                    log(f"page mode or title not read: {error}")
+            if shows and not screen.off_charging:
+                screen.set_on(True)
+            else:
+                screen.keep_awake()
+            events.send(body)
+        self.reply(200, {"ok": True})
+
+    def stream_events(self):
+        events_queue = events.connect()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            while True:
+                try:
+                    line = "data: " + json.dumps(events_queue.get(timeout=15), ensure_ascii=False) + "\n\n"
+                except queue.Empty:
+                    line = ": alive\n\n"
+                self.wfile.write(line.encode())
+                self.wfile.flush()
+        except OSError:
+            pass                    # the UI closed: this is the normal way out
+        finally:
+            events.disconnect(events_queue)
+
+    def serve_file(self, route):
+        # Fonts, pages and objects live outside the UI folder.
+        root = WEB
+        for prefix, folder in (("/fonts/", FONTS), ("/surfaces/", SURFACES), ("/house-files/", HOUSE_FILES),
+                               ("/photos/", PHOTOS)):
+            if route.startswith(prefix):
+                root, route = folder, route[len(prefix) - 1:]
+        relative = "index.html" if route == "/" else urllib.parse.unquote(route.lstrip("/"))
+        full = os.path.realpath(os.path.join(root, relative))
+        if not full.startswith(os.path.realpath(root) + os.sep) or not os.path.isfile(full):
+            self.reply(404, b"not found", "text/plain; charset=utf-8")
+            return
+        content_type = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        if content_type.startswith("text/"):
+            content_type += "; charset=utf-8"
+        with open(full, "rb") as f:
+            self.reply(200, f.read(), content_type)
+
+
+def main():
+    threading.Thread(target=inputs, daemon=True).start()
+    threading.Thread(target=supervised, args=(time_round,), daemon=True).start()
+    threading.Thread(target=supervised, args=(disk_round,), daemon=True).start()
+    events.send({"type": "screen", "on": screen.on})
+    events.send({"type": "off_charging", "active": screen.off_charging})
+    events.send({"type": "voice", "state": "closed"})
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server.daemon_threads = True
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

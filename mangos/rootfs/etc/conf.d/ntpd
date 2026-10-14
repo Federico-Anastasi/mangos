@@ -1,0 +1,2 @@
+# Network time (busybox ntpd, service ntpd), as a client: the servers it asks.
+NTPD_OPTS="-N -p 0.pool.ntp.org -p 1.pool.ntp.org -p 2.pool.ntp.org"

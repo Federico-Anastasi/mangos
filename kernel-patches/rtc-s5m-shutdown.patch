@@ -1,0 +1,12 @@
+diff --git a/drivers/rtc/rtc-s5m.c b/drivers/rtc/rtc-s5m.c
+index 23e3e84c9..f0360b82b 100644
+--- a/drivers/rtc/rtc-s5m.c
++++ b/drivers/rtc/rtc-s5m.c
+@@ -997,6 +997,7 @@ static struct platform_driver s5m_rtc_driver = {
+ 		.pm	= &s5m_rtc_pm_ops,
+ 	},
+ 	.probe		= s5m_rtc_probe,
++	.shutdown	= s5m_rtc_shutdown,
+ 	.id_table	= s5m_rtc_id,
+ };
+ 

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Saves the time at shutdown, to the phone's clock if present and in any case to disk.
+mkdir -p /var/lib/mangos
+date -u +%s > /var/lib/mangos/last-time
+[ -e /dev/rtc0 ] && hwclock -w -u 2>/dev/null
+exit 0

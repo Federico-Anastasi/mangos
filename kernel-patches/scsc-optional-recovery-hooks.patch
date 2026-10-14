@@ -1,0 +1,25 @@
+diff --git a/drivers/misc/samsung/scsc/mxman.c b/drivers/misc/samsung/scsc/mxman.c
+index c61626a85..47586db10 100644
+--- a/drivers/misc/samsung/scsc/mxman.c
++++ b/drivers/misc/samsung/scsc/mxman.c
+@@ -1488,7 +1488,9 @@ static int mxman_start(struct mxman *mxman)
+ 		mif->unmap(mif, mxman->start_dram);
+ 		return r;
+ 	}
+-	mif->recovery_disabled_reg(mif, mxman_recovery_disabled);
++	/* Not every platform interface implements the recovery-disabled hooks. */
++	if (mif->recovery_disabled_reg)
++		mif->recovery_disabled_reg(mif, mxman_recovery_disabled);
+ 	mbox_init(mxman, fwhdr->firmware_entry_point);
+ 	init_completion(&mxman->mm_msg_start_ind_completion);
+ 	init_completion(&mxman->mm_msg_halt_rsp_completion);
+@@ -2580,7 +2582,8 @@ static void mxman_stop(struct mxman *mxman)
+ #ifdef CONFIG_SCSC_LAST_PANIC_IN_DRAM
+ 	scsc_log_in_dram_mmap_destroy();
+ #endif
+-	mif->recovery_disabled_unreg(mif);
++	if (mif->recovery_disabled_unreg)
++		mif->recovery_disabled_unreg(mif);
+ 	/* Release the MIF memory resources */
+ 	mif->unmap(mif, mxman->start_dram);
+ }

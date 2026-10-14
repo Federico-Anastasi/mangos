@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+# mangOS voice: keeps the speech synthesis model in memory (loading it takes many seconds) and
+# speaks aloud what the mangos-speak command sends it.
+
+description="Speech synthesis: speaks text through the speaker"
+supervisor=supervise-daemon
+command=/usr/bin/mangos-speak
+command_args="--service"
+output_log=/var/log/mangos-speak.log
+error_log=/var/log/mangos-speak.log
+respawn_delay=5
+# A configuration that cannot work stops the service instead of restarting it for ever.
+respawn_max=5
+respawn_period=60
+
+depend() {
+	need localmount
+}

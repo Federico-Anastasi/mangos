@@ -1,0 +1,18 @@
+diff --git a/drivers/net/wireless/scsc/sap_ma.c b/drivers/net/wireless/scsc/sap_ma.c
+index b07b368d1..388435efc 100644
+--- a/drivers/net/wireless/scsc/sap_ma.c
++++ b/drivers/net/wireless/scsc/sap_ma.c
+@@ -625,11 +625,10 @@ void slsi_rx_data_deliver_skb(struct slsi_dev *sdev, struct net_device *dev, str
+ #endif
+ 		drop_proto = rx_skb->protocol;
+ 		if (ctx_napi) {
+-			if (GRO_CONSUMED == napi_gro_receive(&sdev->hip4_inst.hip_priv->napi, rx_skb))
+-				SLSI_NET_WARN(dev, "Packet is dropped. Protocol=%hx\n", ntohs(drop_proto));
++			napi_gro_receive(&sdev->hip4_inst.hip_priv->napi, rx_skb);
+ 		} else {
+ 			if (NET_RX_DROP == netif_receive_skb(rx_skb))
+-				SLSI_NET_WARN(dev, "Packet is dropped. Protocol=%hx\n", ntohs(drop_proto));
++				SLSI_NET_DBG3(dev, SLSI_RX, "Packet is dropped. Protocol=%hx\n", ntohs(drop_proto));
+ 		}
+ #else /* #ifdef CONFIG_SCSC_WLAN_RX_NAPI_GRO */
+ 		netif_receive_skb(rx_skb);

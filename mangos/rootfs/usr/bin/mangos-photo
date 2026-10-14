@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+"""mangos-photo: takes a photo with one of the phone's cameras and saves it as JPEG.
+
+Usage: mangos-photo [--front] [-o file.jpg] [--long-side pixels] [--preview seconds]
+       mangos-photo --service      stays ready and takes what the command asks of it
+
+Without --front it uses the rear camera. Without -o the photo goes to /var/lib/mangos/photos
+with the date and time in the name; the path is printed. --long-side shrinks the photo so that
+its long side is that.
+Before the shot the camera stays on and light and focus adjust by themselves (the rear lens
+tries several positions and keeps the sharpest at the center): the shot is taken as soon as
+they are right (not before a second and a half, not after three seconds or the seconds of
+--preview).
+--preview also shows, in a small window on the UI, what the camera is seeing: whoever stands in
+front of the phone sees what the entity is looking at and can aim. Then the shot stays in the
+window for a few seconds.
+Loading the compute libraries takes time on every start: so the mangos-photo service (started at
+boot) keeps them loaded, and the command only hands it the request. Without the service the
+command stops with an error.
+
+The sensors (/dev/camera-rear, /dev/camera-front) give raw pixels and there is no image
+processor: this program develops them into the color image.
+"""
+import json
+import os
+import socket
+import sys
+
+SOCKET = "/run/mangos/photo.sock"
+
+
+def from_service():
+    """Passes the request to the service and relays its messages and result: so the command loads
+    nothing heavy. Never returns."""
+    try:
+        sock = socket.socket(socket.AF_UNIX)
+        sock.connect(SOCKET)
+    except OSError:
+        sys.exit("mangos-photo: the service is not running (rc-service mangos-photo start)")
+    with sock, sock.makefile("rw", encoding="utf-8") as f:
+        f.write(json.dumps({"args": sys.argv[1:], "cwd": os.getcwd()}) + "\n")
+        f.flush()
+        for line in f:
+            kind, _, text = line.rstrip("\n").partition(" ")
+            if kind == "F":
+                sys.exit(int(text))
+            print(text, file=sys.stderr if kind == "E" else sys.stdout, flush=True)
+    sys.exit("mangos-photo: the service closed without saying how it went")
+
+
+if __name__ == "__main__" and sys.argv[1:] != ["--service"]:
+    from_service()
+
+import argparse
+import io
+import shutil
+import signal
+import subprocess
+import time
+import urllib.request
+from dataclasses import dataclass
+
+# Before numpy: otherwise its compute library keeps all the processors busy even when it has
+# nothing to do.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+import numpy
+from PIL import Image
+
+PHOTOS_DIR = "/var/lib/mangos/photos"
+BRIDGE = "http://127.0.0.1:8098"
+# The preview image: written by this program, served by the bridge to the UI.
+PREVIEW_FILE = "/run/mangos/camera.jpg"
+# To adjust light and focus, one square of four pixels is taken every so many, per row and column.
+PREVIEW_STEP = 8
+# Below this time no shot is taken: whoever watches the preview must have time to see it.
+PREVIEW_MIN_S = 1.5
+ADJUST_S = 3                    # how long at most light and focus adjust, if --preview says nothing else
+# Light and focus of each sensor's last shot: adjustment restarts from there, so it is almost
+# right at once. Without it (first shot after boot) the focus starts from a middle distance.
+LAST_FILE = "/run/mangos/photo-last.json"
+START_FOCUS = 320
+FULL_SCALE = 1023               # ten bits: no more than this
+# The right light: the scene average at a sixth of the scale, as cameras do.
+TARGET_LIGHT = 0.16
+MAX_FOCUS = 1023
+
+
+def last_values(sensor):
+    try:
+        with open(LAST_FILE, encoding="utf-8") as f:
+            return json.load(f).get(sensor.device, {})
+    except (OSError, ValueError):
+        return {}
+
+
+def remember(sensor, **values):
+    try:
+        with open(LAST_FILE, encoding="utf-8") as f:
+            everything = json.load(f)
+    except (OSError, ValueError):
+        everything = {}
+    everything[sensor.device] = values
+    try:
+        with open(LAST_FILE, "w", encoding="utf-8") as f:
+            json.dump(everything, f)
+    except OSError:
+        pass                        # the next adjustment will start from farther away, that is all
+
+
+@dataclass(frozen=True)
+class Sensor:
+    device: str
+    width: int
+    height: int
+    black: int                      # what the sensor gives in the dark
+    rows_per_frame: int             # the longest exposure without slowing the sensor: 33 ms
+    min_exposure: int
+    max_exposure: int               # a quarter of a second: beyond it, handheld, it blurs
+    max_gain: int
+    # Where the colors are in the square of four pixels: (row, column).
+    red: tuple
+    greens: tuple
+    blue: tuple
+    focus: bool
+    # How many degrees to turn the image clockwise to make it upright with the phone held upright:
+    # the sensors are mounted sideways.
+    degrees: int
+    mirror: bool                    # in preview, like a mirror: the camera looks at whoever is looking
+    # From the sensor's colors to the screen's, after white balance: three rows (red, green,
+    # blue), each summing to 1 so gray stays gray. None: none.
+    colors: tuple = None
+
+    @property
+    def row_bytes(self):
+        return (self.width * 3 // 2 + 15) // 16 * 16
+
+
+# The front filters overlap: without this correction the image is nearly gray.
+FRONT_COLORS = ((1.75, -0.60, -0.15), (-0.35, 1.60, -0.25), (-0.05, -0.65, 1.70))
+
+REAR = Sensor("/dev/camera-rear", 4080, 3072, 64, 3549, 8, 27000, 64,
+              red=(0, 1), greens=((0, 0), (1, 1)), blue=(1, 0), focus=True,
+              degrees=90, mirror=False)
+FRONT = Sensor("/dev/camera-front", 3264, 2448, 64, 2532, 16, 19000, 16,
+               red=(0, 0), greens=((0, 1), (1, 0)), blue=(1, 1), focus=False,
+               degrees=270, mirror=True, colors=FRONT_COLORS)
+
+
+def unpack_pixels(sensor, data, rows):
+    """The pixels (10 bit) of a number of raw rows."""
+    triples = numpy.frombuffer(data, dtype=numpy.uint8).reshape(rows, sensor.row_bytes)[:, :sensor.width * 3 // 2]
+    triples = triples.reshape(rows, sensor.width // 2, 3).astype(numpy.uint16)
+    out = numpy.empty((rows, sensor.width), dtype=numpy.uint16)
+    out[:, 0::2] = triples[:, :, 0] | (triples[:, :, 1] & 0x0f) << 8
+    out[:, 1::2] = triples[:, :, 1] >> 4 | triples[:, :, 2] << 4
+    # Twelve bits hold values the sensor never sends: rows not yet written, in preview.
+    numpy.minimum(out, FULL_SCALE, out=out)
+    return out
+
+
+def plane(grid, position):
+    """The pixels of one color: one every two rows and every two columns, from (row, column)."""
+    return grid[position[0]::2, position[1]::2].astype(numpy.float32)
+
+
+def shoot(fd, exposure, gain, focus=None):
+    """Takes a shot: from then on that frame is read from the device. Without focus the lens
+    stays where the previous shot left it."""
+    focus_part = "" if focus is None else f"focus={focus} "
+    os.write(fd, f"{focus_part}exposure={exposure} gain={gain} shoot".encode())
+
+
+def split_light(sensor, light):
+    """Splits the wanted light (exposure times gain, in rows) between time and gain: first the
+    time up to one frame (a thirtieth of a second), then the gain up to 16, then longer times,
+    then the rest of the gain. Gain brings noise; long time brings blur and slows the preview,
+    and the phone is held in the hand."""
+    exposure = min(light, sensor.rows_per_frame)
+    gain = min(light / exposure, 16, sensor.max_gain)
+    exposure = min(light / gain, sensor.max_exposure)
+    gain = min(light / exposure, sensor.max_gain)
+    return max(sensor.min_exposure, round(exposure)), max(1, round(gain))
+
+
+def develop(sensor, grid):
+    """From a grid of raw pixels to the color image, half the pixels per side.
+
+    All the math (removing black, balancing white, the screen curve) sits in one table per
+    color, from the raw value to the final value: doing it pixel by pixel with floating-point
+    numbers would be much slower."""
+    red, blue = grid[sensor.red[0]::2, sensor.red[1]::2], grid[sensor.blue[0]::2, sensor.blue[1]::2]
+    # The two greens summed: 0 to 2046.
+    green = grid[sensor.greens[0][0]::2, sensor.greens[0][1]::2] + grid[sensor.greens[1][0]::2, sensor.greens[1][1]::2]
+    # White balance: the scene average, without burnt pixels, becomes gray. Measured on one pixel
+    # in sixteen: enough, and much cheaper.
+    sample = numpy.stack([red[::4, ::4] * 2, green[::4, ::4], blue[::4, ::4] * 2], axis=-1).astype(numpy.float32)
+    sample = (sample / 2 - sensor.black) / (FULL_SCALE - sensor.black)
+    good = sample.max(axis=-1) < 0.95
+    means = numpy.clip(sample[good].mean(axis=0), 1e-4, None) if good.any() else numpy.ones(3)
+    weights = numpy.clip(means[1] / means, 0.5, 4.0)
+
+    def light_table(weight, total):
+        """From the raw value (or the sum of two) to the light, 0 to 1."""
+        return numpy.clip((numpy.arange(FULL_SCALE * total + 1, dtype=numpy.float32) / total - sensor.black)
+                          / (FULL_SCALE - sensor.black) * weight, 0, 1)
+
+    def curve(light):
+        """From the light to the screen value, with the sRGB curve: without it the image would be dark."""
+        return (numpy.where(light <= 0.0031308, light * 12.92, 1.055 * numpy.power(light, 1 / 2.4) - 0.055) * 255 + 0.5).astype(numpy.uint8)
+
+    tables = light_table(weights[0], 1), light_table(weights[1], 2), light_table(weights[2], 1)
+    if sensor.colors is None:
+        return Image.fromarray(numpy.stack([curve(tables[0])[red], curve(tables[1])[green],
+                                            curve(tables[2])[blue]], axis=-1))
+    # The correction mixes the three colors, so it must be done on the light, before the curve:
+    # in integers (light from 0 to TOP, weights in 1024ths), which on the phone costs less than
+    # decimals.
+    TOP = 4095
+    r, g, b = ((t * TOP + 0.5).astype(numpy.int32)[index] for t, index in zip(tables, (red, green, blue)))
+    final = curve(numpy.arange(TOP + 1, dtype=numpy.float32) / TOP)
+    return Image.fromarray(numpy.stack([
+        final[numpy.clip((r * round(m[0] * 1024) + g * round(m[1] * 1024) + b * round(m[2] * 1024)) >> 10, 0, TOP)]
+        for m in sensor.colors], axis=-1))
+
+
+def upright(image, degrees, mirror=False):
+    """The image turned like the phone (Pillow turns counterclockwise) and, if needed, mirrored."""
+    if degrees:
+        image = image.transpose({90: Image.Transpose.ROTATE_270, 180: Image.Transpose.ROTATE_180,
+                                 270: Image.Transpose.ROTATE_90}[degrees])
+    return image.transpose(Image.Transpose.FLIP_LEFT_RIGHT) if mirror else image
+
+
+def to_ui(**event):
+    """Tells the UI something through the bridge. If the bridge is not there, never mind: the
+    photo is taken anyway."""
+    request = urllib.request.Request(BRIDGE + "/command", data=json.dumps({"type": "camera", **event}).encode(),
+                                     headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(request, timeout=2).read()
+    except OSError:
+        pass
+
+
+class Viewfinder:
+    """The small window on the UI: every image goes to a file the bridge serves, and the UI is
+    told to reload it."""
+
+    def __init__(self, sensor):
+        self.sensor, self.number = sensor, 0
+        os.makedirs(os.path.dirname(PREVIEW_FILE), exist_ok=True)
+
+    def show(self, image, state, ready=False):
+        """Sends an image to the window. `ready`: it is already upright, and not mirrored."""
+        buffer = io.BytesIO()
+        if not ready:
+            image = upright(image, self.sensor.degrees, self.sensor.mirror)
+        image.save(buffer, "JPEG", quality=70)
+        with open(PREVIEW_FILE + ".new", "wb") as f:
+            f.write(buffer.getvalue())
+        os.replace(PREVIEW_FILE + ".new", PREVIEW_FILE)
+        self.number += 1
+        to_ui(state=state, number=self.number)
+
+    def close(self):
+        to_ui(state="closed")
+
+
+def reduced_grid(sensor, fd):
+    """The incoming frame, one square of four pixels every PREVIEW_STEP."""
+    step = 2 * PREVIEW_STEP
+    rows = b"".join(os.pread(fd, 2 * sensor.row_bytes, row * sensor.row_bytes) for row in range(0, sensor.height, step))
+    whole = unpack_pixels(sensor, rows, len(rows) // sensor.row_bytes)
+    columns = numpy.arange(0, sensor.width, step)
+    return whole[:, numpy.stack([columns, columns + 1], axis=1).ravel()]
+
+
+def light_of(sensor, grid):
+    """Mean of the greens and share of burnt pixels of a grid."""
+    greens = plane(grid, sensor.greens[0])
+    return float((numpy.clip(greens, sensor.black, None) - sensor.black).mean() / (FULL_SCALE - sensor.black)), float((greens >= FULL_SCALE - 8).mean())
+
+
+def sharpness_of(sensor, grid):
+    """How sharp the center of a reduced grid is: the mean of the differences between
+    neighboring greens. The more the lens is in focus, the steeper the edges."""
+    height, width = grid.shape
+    greens = plane(grid[height // 4 // 2 * 2:height * 3 // 4, width // 4 // 2 * 2:width * 3 // 4], sensor.greens[0])
+    return float(numpy.abs(numpy.diff(greens, axis=1)).mean() + numpy.abs(numpy.diff(greens, axis=0)).mean())
+
+
+class FocusSearch:
+    """The focus search, one position at a time. It starts where the lens was in focus last time
+    and moves while the sharpness grows: five or six positions are usually enough."""
+
+    STEP, FINE = 96, 32
+
+    def __init__(self, start):
+        self.measures = {}
+        self.pending = [start, min(start + self.STEP, MAX_FOCUS), max(start - self.STEP, 0)]
+        self.refined = False
+
+    def best(self):
+        return max(self.measures, key=self.measures.get)
+
+    def next_position(self):
+        """The next position to try, or None if the search is over."""
+        while True:
+            while self.pending:
+                position = self.pending.pop(0)
+                if position not in self.measures:
+                    return position
+            if not self.measures:
+                return None
+            best = self.best()
+            if self.refined:
+                return None
+            # The best is at one end of what was tried: go on in that direction.
+            beyond = best + self.STEP if best == max(self.measures) else best - self.STEP if best == min(self.measures) else None
+            if beyond is not None and 0 <= beyond <= MAX_FOCUS:
+                self.pending = [beyond]
+                continue
+            # It is in the middle: two fine steps at its sides, and that is all.
+            self.refined = True
+            self.pending = [f for f in (best - self.FINE, best + self.FINE) if 0 <= f <= MAX_FOCUS]
+
+
+def adjust(sensor, fd, viewfinder, seconds):
+    """Keeps the camera on while adjusting the light and, with the rear camera, searching the
+    focus; with a `viewfinder` it meanwhile sends its images to the UI. It ends as soon as light
+    and focus are right, but not before PREVIEW_MIN_S nor after `seconds`. Returns the exposure,
+    gain and focus (None for the front camera) to shoot with. The camera stays on."""
+    previous = last_values(sensor)
+    try:
+        exposure, gain = split_light(sensor, float(previous["exposure"]) * float(previous["gain"]))
+    except (KeyError, TypeError, ValueError):
+        exposure, gain = split_light(sensor, sensor.rows_per_frame * 4)
+    focus, focus_search = None, None
+    if sensor.focus:
+        try:
+            focus = max(0, min(MAX_FOCUS, int(previous["focus"])))
+        except (KeyError, TypeError, ValueError):
+            focus = START_FOCUS
+        focus_search = FocusSearch(focus)
+        focus_search.next_position()    # the first position is the one the lens starts from
+    focus_part = "" if focus is None else f"focus={focus} "
+    os.write(fd, f"{focus_part}exposure={exposure} gain={gain} start".encode())
+    began = time.monotonic()
+    tried = focus if focus_search else None
+    # After a change the frame read may still be the previous one: let it pass.
+    settle_until = began + 0.25
+    mean = 0
+    while True:
+        grid = reduced_grid(sensor, fd)
+        if viewfinder:
+            viewfinder.show(develop(sensor, grid), "live")
+        now = time.monotonic()
+        expired = now >= began + seconds
+        if now < settle_until and not expired:
+            continue
+        mean, burnt = light_of(sensor, grid)
+        factor = 1 / 4 if burnt > 0.25 else TARGET_LIGHT / max(mean, 0.002)
+        if not 0.75 < factor < 1.33 and not expired:
+            new = split_light(sensor, min(max(exposure * gain * factor, sensor.min_exposure),
+                                          sensor.max_exposure * sensor.max_gain))
+            if new != (exposure, gain):
+                exposure, gain = new
+                os.write(fd, f"exposure={exposure} gain={gain}".encode())
+                settle_until = time.monotonic() + 0.2
+                continue                # sharpness is measured with the light still
+        if focus_search:
+            if tried is not None:
+                focus_search.measures[tried] = sharpness_of(sensor, grid)
+            tried = None if expired else focus_search.next_position()
+            if tried is None:
+                focus = focus_search.best()
+                print(f"mangos-photo: focus chosen {focus} among {sorted(focus_search.measures)}", file=sys.stderr)
+                focus_search = None
+            else:
+                focus = tried
+            os.write(fd, f"focus={focus}".encode())      # back to a still lens: the wait is in the module
+            settle_until = time.monotonic() + 0.07
+            continue
+        if expired or now >= began + PREVIEW_MIN_S:
+            break
+    remember(sensor, exposure=exposure, gain=gain, focus=focus)
+    print(f"mangos-photo: after {time.monotonic() - began:.1f} s of adjustment: exposure {exposure} rows, "
+          f"gain {gain}, light {mean:.3f}", file=sys.stderr)
+    return exposure, gain, focus
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Takes a photo with one of the phone's cameras.")
+    parser.add_argument("--front", action="store_true", help="use the front camera")
+    parser.add_argument("-o", dest="output", help="the JPEG file to write")
+    parser.add_argument("--long-side", type=int, metavar="PIXELS",
+                        help="shrinks the photo so its long side is this: enough for whoever only "
+                             "has to look at it, and it weighs much less")
+    parser.add_argument("--preview", type=float, metavar="SECONDS",
+                        help="shows on the UI what the camera sees, for at most this many seconds "
+                             f"before the shot (without: {ADJUST_S}, showing nothing)")
+    opts = parser.parse_args()
+    sensor = FRONT if opts.front else REAR
+    viewfinder = Viewfinder(sensor) if opts.preview else None
+    seconds = ADJUST_S if opts.preview is None else opts.preview
+
+    if not os.path.exists(sensor.device):
+        # The module loads at the first photo: with the camera idle it is not needed.
+        subprocess.run(["modprobe", "camera"], capture_output=True)
+    try:
+        fd = os.open(sensor.device, os.O_RDWR)
+    except OSError as error:
+        sys.exit(f"mangos-photo: {sensor.device} cannot be opened ({error.strerror}): camera module missing, "
+                 "or camera already in use (also the other one: they do not open together)")
+    try:
+        exposure, gain, focus = adjust(sensor, fd, viewfinder, seconds)
+        shoot(fd, exposure, gain, focus)                # from on: one whole frame, then it turns off
+        raw = os.pread(fd, sensor.row_bytes * sensor.height, 0)
+    except OSError as error:
+        if viewfinder:
+            viewfinder.close()
+        sys.exit(f"mangos-photo: shot failed ({error.strerror}): see /sys/kernel/debug/"
+                 + os.path.basename(sensor.device))
+    finally:
+        os.close(fd)
+    if len(raw) != sensor.row_bytes * sensor.height:
+        sys.exit(f"mangos-photo: incomplete frame ({len(raw)} bytes)")
+
+    output = opts.output or os.path.join(PHOTOS_DIR, time.strftime("photo-%Y%m%d-%H%M%S.jpg"))
+    os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+    photo = upright(develop(sensor, unpack_pixels(sensor, raw, sensor.height)), sensor.degrees)
+    if opts.long_side:
+        photo.thumbnail((opts.long_side, opts.long_side))
+    photo.save(output, "JPEG", quality=90)
+    if viewfinder:
+        # The shot stays in the window: the UI closes it by itself after a few seconds.
+        photo.thumbnail((640, 640))
+        viewfinder.show(photo, "shot", ready=True)
+    print(output)
+
+
+def serve():
+    """Stays ready with the libraries loaded. Each request (a JSON line with the command's
+    arguments and the folder it was given from) is run by a child, which starts already ready;
+    the lines written (O for output, E for messages) and finally the result (F) go back to the
+    command. One photo at a time is guaranteed by the module, which lets only one camera open at
+    a time. Root and the pim group can ask."""
+    os.makedirs(os.path.dirname(SOCKET), exist_ok=True)
+    if os.path.exists(SOCKET):
+        os.unlink(SOCKET)
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(SOCKET)
+    shutil.chown(SOCKET, group="pim")
+    os.chmod(SOCKET, 0o660)
+    server.listen()
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)       # finished children do not linger
+
+    class Relay:
+        def __init__(self, f, kind):
+            self.f, self.kind = f, kind
+
+        def write(self, text):
+            for line in text.splitlines():
+                if line:
+                    self.f.write(f"{self.kind} {line}\n")
+            return len(text)
+
+        def flush(self):
+            self.f.flush()
+
+    while True:
+        client = server.accept()[0]
+        if os.fork():
+            client.close()
+            continue
+        result = 1
+        with client, client.makefile("rw", encoding="utf-8") as f:
+            try:
+                request = json.loads(f.readline())
+                os.chdir(request["cwd"])
+                sys.argv[1:] = [str(a) for a in request["args"]]
+                sys.stdout, sys.stderr = Relay(f, "O"), Relay(f, "E")
+                main()
+                result = 0
+            except SystemExit as exit_:
+                # sys.exit with a text: the text is the message, the result is 1.
+                if isinstance(exit_.code, str):
+                    f.write(f"E {exit_.code}\n")
+                else:
+                    result = exit_.code or 0
+            except Exception as error:          # any failure must be told to whoever asked
+                f.write(f"E mangos-photo: failure ({type(error).__name__}: {error})\n")
+            try:
+                f.write(f"F {result}\n")
+                f.flush()
+            except OSError:
+                pass                            # the requester no longer waits
+        os._exit(0)
+
+
+if __name__ == "__main__":
+    serve()

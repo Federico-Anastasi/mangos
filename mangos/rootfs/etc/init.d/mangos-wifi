@@ -1,0 +1,37 @@
+#!/sbin/openrc-run
+# Wi-Fi: wpa_supplicant keeps the connection to the network chosen with scripts/phone_wifi.sh.
+# It does not start while no network is saved.
+
+description="Wi-Fi connection"
+supervisor=supervise-daemon
+command=/sbin/wpa_supplicant
+command_args="-i wlan0 -c /etc/wpa_supplicant/wpa_supplicant.conf"
+required_files=/etc/wpa_supplicant/wpa_supplicant.conf
+output_log=/var/log/mangos-wifi.log
+error_log=/var/log/mangos-wifi.log
+respawn_delay=3
+respawn_max=0
+
+depend() {
+	need localmount
+}
+
+# The factory MAC address lives in the efs partition. The driver looks for it in this file when
+# the interface comes up; without it, it uses a fallback one. It is copied once, mounting efs
+# read-only and without touching its journal: the partition cannot be rebuilt.
+MAC=/lib/firmware/conf/wlan/mac.txt
+mac_valid() { grep -Eq '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' "$MAC" 2> /dev/null; }
+
+start_pre() {
+	mac_valid && return 0
+	uevent=$(grep -l '^PARTNAME=efs$' /sys/class/block/*/uevent 2> /dev/null)
+	if [ -n "$uevent" ]; then
+		mkdir -p /mnt/efs "$(dirname "$MAC")"
+		if mount -o ro,noload "/dev/$(basename "$(dirname "$uevent")")" /mnt/efs 2> /dev/null; then
+			tr -d '\r\n ' < /mnt/efs/wifi/.mac.cob > "$MAC" 2> /dev/null
+			umount /mnt/efs
+		fi
+	fi
+	mac_valid || { rm -f "$MAC"; echo "factory MAC address not read from efs: the fallback one stays" > /var/log/wifi-mac.log; }
+	return 0
+}

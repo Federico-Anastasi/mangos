@@ -1,0 +1,8 @@
+#!/bin/sh
+# System time at boot: from the phone's clock if it reads 2026 or later (a reset clock restarts
+# from an older date), otherwise from the last time saved at shutdown: better than starting
+# from 1970 until a network is there to take it from.
+if [ -e /dev/rtc0 ] && hwclock -s -u 2>/dev/null && [ "$(date +%Y)" -ge 2026 ]; then
+    exit 0
+fi
+[ -s /var/lib/mangos/last-time ] && date -u -s "@$(cat /var/lib/mangos/last-time)" > /dev/null

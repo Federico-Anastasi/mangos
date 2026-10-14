@@ -1,0 +1,117 @@
+diff --git a/drivers/clk/samsung/clk-acpm.c b/drivers/clk/samsung/clk-acpm.c
+index 7680bc8c5..91bf02c85 100644
+--- a/drivers/clk/samsung/clk-acpm.c
++++ b/drivers/clk/samsung/clk-acpm.c
+@@ -21,8 +21,12 @@ struct acpm_clk {
+ 	struct clk_hw hw;
+ 	unsigned int mbox_chan_id;
+ 	struct acpm_handle *handle;
++	unsigned long last_rate;
+ };
+ 
++/* Exynos850 firmware answers every rate query with all bits set, in kHz. */
++#define ACPM_CLK_RATE_UNKNOWN	(U32_MAX * 1000UL)
++
+ struct acpm_clk_variant {
+ 	const char *name;
+ };
+@@ -63,22 +67,56 @@ static const struct acpm_clk_driver_data acpm_clk_gs101 = {
+ 	.mbox_chan_id = 0,
+ };
+ 
++/* Order follows dt-bindings/clock/samsung,exynos850-acpm.h. */
++static const struct acpm_clk_variant exynos850_acpm_clks[] = {
++	ACPM_CLK("mif"),
++	ACPM_CLK("int"),
++	ACPM_CLK("cpucl0"),
++	ACPM_CLK("cpucl1"),
++	ACPM_CLK("g3d"),
++	ACPM_CLK("aud"),
++	ACPM_CLK("cam"),
++	ACPM_CLK("disp"),
++	ACPM_CLK("cp"),
++};
++
++static const struct acpm_clk_driver_data acpm_clk_exynos850 = {
++	.clks = exynos850_acpm_clks,
++	.nr_clks = ARRAY_SIZE(exynos850_acpm_clks),
++	.mbox_chan_id = 0,
++};
++
+ static unsigned long acpm_clk_recalc_rate(struct clk_hw *hw,
+ 					  unsigned long parent_rate)
+ {
+ 	struct acpm_clk *clk = to_acpm_clk(hw);
++	unsigned long rate;
+ 
+-	return clk->handle->ops->dvfs.get_rate(clk->handle, clk->mbox_chan_id,
++	rate = clk->handle->ops->dvfs.get_rate(clk->handle, clk->mbox_chan_id,
+ 					       clk->id);
++	/*
++	 * When the firmware cannot tell the rate, report the last one it
++	 * accepted. Until the first request that is zero: the rate left by the
++	 * bootloader has to come from assigned-clock-rates.
++	 */
++	if (!rate || rate == ACPM_CLK_RATE_UNKNOWN)
++		return clk->last_rate;
++
++	return rate;
+ }
+ 
+ static int acpm_clk_set_rate(struct clk_hw *hw, unsigned long rate,
+ 			     unsigned long parent_rate)
+ {
+ 	struct acpm_clk *clk = to_acpm_clk(hw);
++	int ret;
++
++	ret = clk->handle->ops->dvfs.set_rate(clk->handle, clk->mbox_chan_id,
++					      clk->id, rate);
++	if (!ret)
++		clk->last_rate = rate;
+ 
+-	return clk->handle->ops->dvfs.set_rate(clk->handle, clk->mbox_chan_id,
+-					       clk->id, rate);
++	return ret;
+ }
+ 
+ static const struct clk_ops acpm_clk_ops = {
+@@ -101,6 +139,7 @@ static int acpm_clk_register(struct device *dev, struct acpm_clk *aclk,
+ 
+ static int acpm_clk_probe(struct platform_device *pdev)
+ {
++	const struct acpm_clk_driver_data *data;
+ 	struct acpm_handle *acpm_handle;
+ 	struct clk_hw_onecell_data *clk_data;
+ 	struct clk_hw **hws;
+@@ -114,8 +153,9 @@ static int acpm_clk_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(acpm_handle),
+ 				     "Failed to get acpm handle\n");
+ 
+-	count = acpm_clk_gs101.nr_clks;
+-	mbox_chan_id = acpm_clk_gs101.mbox_chan_id;
++	data = (const struct acpm_clk_driver_data *)platform_get_device_id(pdev)->driver_data;
++	count = data->nr_clks;
++	mbox_chan_id = data->mbox_chan_id;
+ 
+ 	clk_data = devm_kzalloc(dev, struct_size(clk_data, hws, count),
+ 				GFP_KERNEL);
+@@ -142,8 +182,7 @@ static int acpm_clk_probe(struct platform_device *pdev)
+ 
+ 		hws[i] = &aclk->hw;
+ 
+-		err = acpm_clk_register(dev, aclk,
+-					acpm_clk_gs101.clks[i].name);
++		err = acpm_clk_register(dev, aclk, data->clks[i].name);
+ 		if (err)
+ 			return dev_err_probe(dev, err,
+ 					     "Failed to register clock\n");
+@@ -154,7 +193,8 @@ static int acpm_clk_probe(struct platform_device *pdev)
+ }
+ 
+ static const struct platform_device_id acpm_clk_id[] = {
+-	{ .name = "gs101-acpm-clk" },
++	{ .name = "gs101-acpm-clk", .driver_data = (kernel_ulong_t)&acpm_clk_gs101 },
++	{ .name = "exynos850-acpm-clk", .driver_data = (kernel_ulong_t)&acpm_clk_exynos850 },
+ 	{ }
+ };
+ MODULE_DEVICE_TABLE(platform, acpm_clk_id);

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- mangOS boot screen, 1080 x 2408 (M13 display). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="2408" viewBox="0 0 1080 2408">
+  <defs>
+    <linearGradient id="skin" x1="0.15" y1="0.1" x2="0.85" y2="0.95">
+      <stop offset="0" stop-color="#FFD84A"/>
+      <stop offset="0.5" stop-color="#FFA61F"/>
+      <stop offset="1" stop-color="#F0532B"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1080" height="2408" fill="#000000"/>
+
+  <!-- Mango: drawn in a 200 x 200 box, scaled to 340 px and centered -->
+  <g transform="translate(370 776) scale(1.7)">
+    <path d="M 96 52 C 142 40 182 78 176 126 C 171 166 134 190 94 184 C 66 180 44 172 24 150
+             C 34 150 42 144 44 132 C 46 92 62 60 96 52 Z" fill="url(#skin)"/>
+    <path d="M 78 78 C 62 90 56 108 56 126" fill="none" stroke="#FFF3B0" stroke-width="7"
+          stroke-linecap="round" opacity="0.75"/>
+  </g>
+
+  <text x="540" y="1290" text-anchor="middle" font-family="Inter Display, Inter" font-weight="600"
+        font-size="132" letter-spacing="-2" fill="#FFFFFF">mang<tspan fill="#FFA61F">OS</tspan></text>
+
+  <text x="540" y="2250" text-anchor="middle" font-family="Inter" font-weight="400"
+        font-size="36" letter-spacing="1" fill="#9A9A9A">by Federico Anastasi</text>
+</svg>

@@ -1,0 +1,22 @@
+#!/bin/sh
+# Links /dev/disk/by-partlabel/<name> for the internal storage partitions, so scripts refer to
+# partitions by name (boot, up_param, userdata...) and not by number.
+#
+# The entity is root: the partitions holding the bootloader and the factory data, which cannot be
+# rebuilt, are made read-only so a wrong command cannot write them. The four that mangOS really
+# writes stay writable.
+mkdir -p /dev/disk/by-partlabel
+for uevent in /sys/class/block/*/uevent; do
+    name=$(sed -n 's/^PARTNAME=//p' "$uevent")
+    [ -n "$name" ] || continue
+    dev=$(basename "$(dirname "$uevent")")
+    ln -sf "/dev/$dev" "/dev/disk/by-partlabel/$name"
+    case "$dev" in
+    mmcblk0p*)
+        case "$name" in
+        boot | recovery | up_param | userdata) ;;
+        *) blockdev --setro "/dev/$dev" || echo "05-partlabels: $name stays writable" >&2 ;;
+        esac ;;
+    esac
+done
+exit 0

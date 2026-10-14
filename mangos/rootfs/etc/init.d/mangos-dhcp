@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+# Address on the Wi-Fi: udhcpc asks the network for one and renews it before it runs out.
+
+description="DHCP client on the Wi-Fi"
+supervisor=supervise-daemon
+command=/sbin/udhcpc
+command_args="-f -i wlan0 -x hostname:mangos"
+output_log=/var/log/mangos-dhcp.log
+error_log=/var/log/mangos-dhcp.log
+respawn_delay=3
+respawn_max=0
+
+depend() {
+	need mangos-wifi
+	provide net
+}

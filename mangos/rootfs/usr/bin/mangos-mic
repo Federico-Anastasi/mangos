@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""mangos-mic: the phone's microphone as an audio stream, for whoever transcribes.
+
+Reads /dev/abox-mic (48 kHz, 16 bit, two channels: the abox module provides it while the device
+stays open, and the left channel is used) and writes raw audio to the output at 16 kHz, mono,
+16 bit: the format mangos-transcribe wants. It stops when the reader closes.
+
+The microphone gives a weak signal: it is multiplied by the `gain` value in /etc/mangos/voice
+(8 if missing), clipping what exceeds the maximum.
+"""
+import array
+import os
+import sys
+
+DEVICE = "/dev/abox-mic"
+SETTINGS = "/etc/mangos/voice"
+BLOCK = 48000 * 4 // 10         # a tenth of a second
+
+
+def read_pairs(path):
+    """Reads a file of key=value lines; lines starting with # are comments."""
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                key, equals, value = line.partition("=")
+                if equals and not key.lstrip().startswith("#"):
+                    values[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return values
+
+
+def gain():
+    try:
+        return max(1, int(read_pairs(SETTINGS).get("gain", "8")))
+    except ValueError:
+        return 8
+
+
+def main():
+    factor = gain()
+    try:
+        source = open(DEVICE, "rb", buffering=0)
+    except OSError as error:
+        sys.exit(f"mangos-mic: {DEVICE} cannot be opened ({error.strerror}): is the abox module loaded?")
+    output = sys.stdout.buffer
+    leftover = b""
+    try:
+        while True:
+            chunk = source.read(BLOCK)
+            if not chunk:
+                break
+            # Work in groups of three samples of two channels: 12 bytes.
+            data = leftover + chunk
+            whole = len(data) // 12 * 12
+            leftover = data[whole:]
+            left = array.array("h", data[:whole])[0::2]
+            # From 48 to 16 kHz: the mean of three neighboring samples.
+            reduced = array.array("h", (
+                max(-32768, min(32767, (a + b + c) * factor // 3))
+                for a, b, c in zip(left[0::3], left[1::3], left[2::3])))
+            output.write(reduced.tobytes())
+            output.flush()
+    except BrokenPipeError:
+        # The reader is done: this is the normal way to stop. The output must be detached,
+        # otherwise Python tries to write to it again at exit and prints an error.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    finally:
+        source.close()              # turns the microphone off
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,33 @@
+#!/bin/sh
+# mangOS UI: the page served by mangos-bridge, full screen.
+#
+# Two parts: the cage compositor, which takes the screen and the touch, and inside it the
+# frameless browser. If /etc/mangos/web-test exists the browser opens debug port 9222, local
+# only, through which a test can send it real touches and read the page. The browser settings
+# that a policy can express are in /etc/chromium/policies/managed/mangos.json.
+PAGE=http://127.0.0.1:8098/
+export XDG_RUNTIME_DIR=/run/user/0
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+
+pidof seatd > /dev/null || seatd -g video > /var/log/seatd.log 2>&1 &
+# The browser starts only when the page answers and seatd has opened its socket: otherwise it
+# would show its own error page and stay there.
+i=0
+until wget -q -T 1 -O /dev/null "$PAGE" 2> /dev/null && [ -S /run/seatd.sock ]; do
+	if [ $i -ge 100 ]; then
+		echo "mangos-web: the page does not answer on $PAGE, not starting the browser" >&2
+		exit 1
+	fi
+	sleep 0.1
+	i=$((i + 1))
+done
+
+TEST=
+[ -e /etc/mangos/web-test ] && TEST=--remote-debugging-port=9222
+# A page made by the entity plays its sounds without waiting for a tap.
+exec cage -s -- chromium --no-sandbox --ozone-platform=wayland --kiosk --start-fullscreen --disable-pinch $TEST \
+	--autoplay-policy=no-user-gesture-required \
+	--user-data-dir=/var/lib/mangos/chromium --no-first-run --lang=it --ignore-gpu-blocklist \
+	--disable-background-networking --disable-default-apps \
+	--disable-features=Vulkan,MediaRouter --password-store=basic \
+	"--app=$PAGE"

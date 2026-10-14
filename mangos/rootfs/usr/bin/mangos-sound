@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""mangos-sound: the speaker for everything that plays at once.
+
+The speaker (/dev/abox-speaker, from the abox module) can be opened by one program at a time.
+So nobody opens it but this service: whatever plays (the pages in the browser, the entity's
+voice, aplay) writes to the ALSA "default" device, which /etc/asound.conf makes a mixer (dmix)
+on the virtual card of the snd-aloop module; this service reads the mix from the other side of
+the card and writes it to the speaker. The speaker is opened when sound arrives and closed after
+QUIET_S of silence: it stays off, and draws nothing, when nothing plays.
+
+The volume is not the mixer's: it is the amplifier's, which all sound goes through, and the
+bridge sets it.
+"""
+import array
+import subprocess
+import sys
+import time
+
+DEVICE = "/dev/abox-speaker"
+# The other side of the virtual card: 48 kHz, 16 bit, two channels, as the speaker wants it.
+CAPTURE = ["arecord", "-q", "-D", "hw:Loopback,1,0", "-f", "S16_LE", "-r", "48000", "-c", "2",
+           "-t", "raw", "--period-time=10000", "--buffer-time=60000"]
+CHUNK = 48000 * 2 * 2 // 50     # 20 ms
+SILENT = 24                     # a chunk whose samples all stay within this is silence
+QUIET_S = 2.0
+
+
+def main():
+    capture = subprocess.Popen(CAPTURE, stdout=subprocess.PIPE)
+    speaker, quiet = None, 0.0
+    try:
+        while chunk := capture.stdout.read(CHUNK):
+            samples = array.array("h", chunk[: len(chunk) // 2 * 2])
+            loud = bool(samples) and (max(samples) > SILENT or min(samples) < -SILENT)
+            if loud:
+                quiet = 0.0
+                if speaker is None:
+                    try:
+                        speaker = open(DEVICE, "wb", buffering=0)
+                        print(time.strftime("%T speaker on"), flush=True)
+                    except OSError as error:
+                        print(f"mangos-sound: the speaker cannot be opened ({error.strerror})",
+                              file=sys.stderr, flush=True)
+                        time.sleep(1)
+                        continue
+            elif speaker is not None:
+                quiet += len(chunk) / (48000 * 4)
+                if quiet >= QUIET_S:
+                    speaker.close()             # it waits for the speaker to play what it has
+                    speaker = None
+                    print(time.strftime("%T speaker off"), flush=True)
+            if speaker is not None:
+                data = chunk
+                while data:
+                    data = data[speaker.write(data):]
+    finally:
+        if speaker is not None:
+            speaker.close()
+        capture.kill()
+    sys.exit(f"mangos-sound: the virtual sound card stopped ({capture.wait()})")
+
+
+if __name__ == "__main__":
+    main()

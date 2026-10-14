@@ -1,0 +1,9 @@
+config TOUCHSCREEN_HIMAX_HX83112F
+	tristate "Himax HX83112F zero-flash SPI touchscreen"
+	depends on SPI_MASTER
+	select CRC32
+	select FW_LOADER
+	help
+	  Himax HX83112F in-cell touchscreen controller on SPI. It has no
+	  flash: its firmware is downloaded at every power-up.
+

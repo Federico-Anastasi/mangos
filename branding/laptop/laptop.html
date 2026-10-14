@@ -1,0 +1,150 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Laptop</title>
+<style>html,body{margin:0;background:transparent;overflow:hidden}canvas{display:block}</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head><body>
+<script>
+// The laptop of the UI as a 3D model. mangos/web/laptop.png is made from it: render the 19 poses
+// yaw=-45,-40,...,45 with color=graphite&bg=transparent in headless Chrome (--headless=new
+// --use-angle=swiftshader --default-background-color=00000000 --window-size=1000,760 --screenshot),
+// crop all of them to the same box and put them side by side, 420 px wide each, from -45 to 45.
+// Parameters from the URL: yaw (degrees, 0 = lid back facing the viewer), color, bg.
+var q = new URLSearchParams(location.search);
+var YAW = (+q.get('yaw') || 0) * Math.PI / 180;
+var COLOR = q.get('color') || 'silver';
+var BG = q.get('bg') || 'transparent';
+var W = +q.get('w') || 1000, H = +q.get('h') || 760;
+
+var renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.25;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+if (BG !== 'transparent') renderer.setClearColor(BG, 1); else renderer.setClearColor(0x000000, 0);
+document.body.appendChild(renderer.domElement);
+
+var scene = new THREE.Scene();
+var camera = new THREE.PerspectiveCamera(26, W / H, 1, 400);
+camera.position.set(0, 30, 78);
+camera.lookAt(0, 7, 0);
+
+// Studio environment for the metal: a soft box with bright panels, prefiltered.
+(function () {
+  var env = new THREE.Scene();
+  var box = new THREE.Mesh(new THREE.BoxGeometry(100, 100, 100), new THREE.MeshBasicMaterial({ color: 0x2a2c33, side: THREE.BackSide }));
+  env.add(box);
+  function panel(w, h, x, y, z, ry, rx, c) {
+    var m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: c, side: THREE.DoubleSide }));
+    m.position.set(x, y, z); m.rotation.y = ry || 0; m.rotation.x = rx || 0; env.add(m);
+  }
+  panel(60, 14, 0, 46, 0, 0, Math.PI / 2, 0xffffff);      // ceiling strip
+  panel(30, 40, -46, 10, 10, Math.PI / 2, 0, 0xffffff);    // left softbox
+  panel(24, 30, 46, 6, -10, -Math.PI / 2, 0, 0xffe9d6);    // right warm card
+  panel(70, 10, 0, 12, 49, Math.PI, 0, 0xffffff);
+  panel(26, 70, 30, 30, 40, -Math.PI * 0.8, 0, 0xf4f6ff);
+  panel(90, 30, 0, -10, 49, Math.PI, 0, 0x3a3c44);           // front fill
+  var pm = new THREE.PMREMGenerator(renderer);
+  scene.environment = pm.fromScene(env, 0.04).texture;
+})();
+
+var key = new THREE.DirectionalLight(0xffffff, 1.6);
+key.position.set(-8, 70, 18); key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048);
+key.shadow.camera.left = -40; key.shadow.camera.right = 40; key.shadow.camera.top = 40; key.shadow.camera.bottom = -40;
+key.shadow.radius = 6;
+scene.add(key);
+scene.add(new THREE.HemisphereLight(0xcfd8ff, 0x20202a, 0.35));
+
+// Shadow catcher.
+var ground = new THREE.Mesh(new THREE.PlaneGeometry(200, 200), new THREE.ShadowMaterial({ opacity: 0.28 }));
+ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true; scene.add(ground);
+
+var METAL = {
+  silver: { c: 0xe3e4e8, r: 0.24 },
+  graphite: { c: 0x6a7282, r: 0.28 },
+  graphite2: { c: 0x5c6577, r: 0.3 },
+  graphite3: { c: 0x7a8396, r: 0.26 },
+  midnight: { c: 0x283044, r: 0.34 },
+  rose: { c: 0xe9c9c3, r: 0.32 }
+}[COLOR] || { c: 0xd6d9df, r: 0.32 };
+var alu = new THREE.MeshPhysicalMaterial({ color: new THREE.Color(METAL.c).convertSRGBToLinear(), metalness: 1, roughness: METAL.r, clearcoat: 0.25, clearcoatRoughness: 0.4 });
+var dark = new THREE.MeshStandardMaterial({ color: 0x08090b, metalness: 0, roughness: 0.8, envMapIntensity: 0.3 });
+var keyMat = new THREE.MeshStandardMaterial({ color: 0x050506, metalness: 0, roughness: 0.9, envMapIntensity: 0.08 });
+
+// A rounded slab: rounded rectangle extruded, with a small bevel on the edges.
+function slab(w, d, t, r, bevel, mat) {
+  var s = new THREE.Shape(), x = -w / 2, y = -d / 2;
+  s.moveTo(x + r, y); s.lineTo(x + w - r, y); s.quadraticCurveTo(x + w, y, x + w, y + r);
+  s.lineTo(x + w, y + d - r); s.quadraticCurveTo(x + w, y + d, x + w - r, y + d);
+  s.lineTo(x + r, y + d); s.quadraticCurveTo(x, y + d, x, y + d - r);
+  s.lineTo(x, y + r); s.quadraticCurveTo(x, y, x + r, y);
+  var g = new THREE.ExtrudeGeometry(s, { depth: t - 2 * bevel, bevelEnabled: true, bevelThickness: bevel, bevelSize: bevel, bevelSegments: 5, curveSegments: 16 });
+  g.translate(0, 0, -(t - 2 * bevel) / 2);
+  var m = new THREE.Mesh(g, mat); m.castShadow = true; m.receiveShadow = true; return m;
+}
+
+var LW = 30.4, LD = 21.2;               // footprint, cm
+var laptop = new THREE.Group();
+scene.add(laptop);
+
+// Base: lies flat; the hinge is at z = 0, the keyboard extends toward -z (away from the viewer).
+var base = slab(LW, LD, 1.1, 1.0, 0.25, alu);
+base.rotation.x = -Math.PI / 2; base.position.set(0, 0.55, -LD / 2);
+laptop.add(base);
+// Keyboard well and keys, trackpad.
+var well = slab(LW - 3.2, 10.6, 0.08, 0.5, 0.02, dark);
+well.rotation.x = -Math.PI / 2; well.position.set(0, 1.12, -LD + 1.6 + 5.3); laptop.add(well);
+for (var row = 0; row < 6; row++) {
+  for (var col = 0; col < 14; col++) {
+    var k = slab(1.5, 1.45, 0.12, 0.18, 0.03, keyMat);
+    k.rotation.x = -Math.PI / 2;
+    k.position.set(-LW / 2 + 2.15 + col * 1.88, 1.18, -LD + 2.4 + row * 1.66);
+    laptop.add(k);
+  }
+}
+var pad = slab(11.5, 7.2, 0.04, 0.6, 0.01, new THREE.MeshPhysicalMaterial({ color: METAL.c, metalness: 0.9, roughness: 0.18 }));
+pad.rotation.x = -Math.PI / 2; pad.position.set(0, 1.12, -4.6); laptop.add(pad);
+
+// Lid: hinged at z = 0, opened ~108 degrees; its back faces the viewer.
+var lidPivot = new THREE.Group(); lidPivot.position.set(0, 1.1, 0.2); laptop.add(lidPivot);
+var OPEN = 108 * Math.PI / 180;
+lidPivot.rotation.x = OPEN - Math.PI / 2;
+var lid = slab(LW, LD, 0.6, 1.0, 0.18, alu);
+lid.position.set(0, LD / 2, 0);   // standing up from the hinge
+lidPivot.add(lid);
+// Screen on the inside (facing away from the viewer), lit.
+var screen = new THREE.Mesh(new THREE.PlaneGeometry(LW - 1.8, LD - 2.2), new THREE.MeshBasicMaterial({ color: 0xbcd4ff }));
+screen.position.set(0, LD / 2 + 0.2, -0.31); screen.rotation.y = Math.PI; lidPivot.add(screen);
+var bezel = new THREE.Mesh(new THREE.PlaneGeometry(LW - 0.6, LD - 0.6), new THREE.MeshBasicMaterial({ color: 0x050507 }));
+bezel.position.set(0, LD / 2, -0.305); bezel.rotation.y = Math.PI; lidPivot.add(bezel);
+// Screen light spilling toward the user's side.
+var glow = new THREE.PointLight(0xa9c6ff, 0.9, 40); glow.position.set(0, 12, -12); lidPivot.add(glow);
+// Hinge bar.
+var hinge = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.55, LW - 6, 24), new THREE.MeshPhysicalMaterial({ color: 0x1c1d22, metalness: 0.8, roughness: 0.35 }));
+hinge.rotation.z = Math.PI / 2; hinge.position.set(0, 0.9, 0.05); laptop.add(hinge);
+
+// The mango logo on the back of the lid, slightly glossy.
+var M = new THREE.Shape();
+M.moveTo(96, 52); M.bezierCurveTo(142, 40, 182, 78, 176, 126); M.bezierCurveTo(171, 166, 134, 190, 94, 184);
+M.bezierCurveTo(66, 180, 44, 172, 24, 150); M.bezierCurveTo(34, 150, 42, 144, 44, 132); M.bezierCurveTo(46, 92, 62, 60, 96, 52);
+var lg = new THREE.ShapeGeometry(M, 24);
+lg.translate(-100, -118, 0); lg.scale(0.03, -0.03, 1);
+var logoMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(0xffa21a).convertSRGBToLinear(), toneMapped: false, side: THREE.DoubleSide });
+var logo = new THREE.Mesh(lg, logoMat);
+logo.position.set(0, LD / 2 + 0.6, 0.31); lidPivot.add(logo);
+
+// Rubber feet seen when turned.
+[[-11, -2], [11, -2], [-11, -LD + 2], [11, -LD + 2]].forEach(function (p) {
+  var f = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, 0.15, 20), dark);
+  f.position.set(p[0], 0.05, p[1]); laptop.add(f);
+});
+
+laptop.position.set(0, 0, LD / 2 - 2);
+laptop.rotation.y = YAW;
+renderer.render(scene, camera);
+document.title = 'ready';
+</script>
+</body></html>

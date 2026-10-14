@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+# USB network to the computer: the ramdisk has already created usb0; here it gets its address
+# and the DHCP server that hands out the computer's address is started.
+
+description="mangOS USB network"
+supervisor=supervise-daemon
+command=/usr/sbin/udhcpd
+command_args="-f /etc/udhcpd.conf"
+respawn_delay=2
+respawn_max=0
+
+depend() {
+	need localmount
+	before sshd
+}
+
+start_pre() {
+	ip link set usb0 up && ip addr replace 172.16.42.1/24 dev usb0
+	# There is a single address to hand out: a lease left over from a previous boot would keep
+	# it taken and the computer would get none.
+	mkdir -p /var/lib/udhcpd && : > /var/lib/udhcpd/udhcpd.leases
+}

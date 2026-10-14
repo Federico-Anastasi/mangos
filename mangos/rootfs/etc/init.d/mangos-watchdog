@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+# mangOS watchdog: while the system is alive, tells the chip every ten seconds that all is well.
+# If the kernel hangs nobody does, and after a minute the chip reboots the phone by itself.
+
+description="Reboots the phone if the system hangs"
+supervisor=supervise-daemon
+command=/bin/busybox
+command_args="watchdog -F -T 60 -t 10 /dev/watchdog"
+respawn_delay=2
+respawn_max=0
+
+depend() {
+	need localmount
+}
+
+start_pre() {
+	[ -c /dev/watchdog ] || { eerror "this kernel has no watchdog"; return 1; }
+}

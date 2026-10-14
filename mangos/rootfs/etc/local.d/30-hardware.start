@@ -1,0 +1,37 @@
+#!/bin/sh
+# Starts the hardware that depends on original Samsung firmware loaded by one of our modules:
+# audio (abox module, audio processor, creates /dev/abox-mic) and motion sensors (chub module,
+# the sensor microcontroller). It also sets the memory policy for huge pages.
+#
+# If a load hangs the kernel, the watchdog reboots the phone and it would start over forever.
+# So before loading a module a marker is left, removed when loading ends: if the marker is
+# already there at boot, that module is not loaded.
+LOG=/var/log/mangos-hardware.log
+note() { echo "$(date '+%d/%m %H:%M:%S') $*" >> "$LOG"; }
+
+# Huge pages only for programs that ask for them: with 3.8 GB and no swap, the 2 MiB pages the
+# kernel would otherwise give to every program cost memory.
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled || note "memory: transparent huge pages not set to madvise"
+
+# load <name> <module>
+load() {
+	marker=/var/lib/mangos/$2-loading
+	if [ -e "$marker" ]; then
+		note "$1: the previous boot did not finish, not loading it. To retry: rm $marker"
+		return
+	fi
+	for firmware in $(modinfo -F firmware "$2"); do
+		[ -e "/lib/firmware/$firmware" ] || { note "$1: missing firmware /lib/firmware/$firmware"; return; }
+	done
+	: > "$marker"
+	sync
+	if modprobe "$2" 2>> "$LOG"; then note "$1: started"; else note "$1: module $2 failed to load"; fi
+	rm -f "$marker"
+}
+
+mkdir -p /var/lib/mangos
+load audio abox
+load sensors chub
+# The state of the two modules (and the accelerometer for the bridge) is read from here.
+mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug
+exit 0

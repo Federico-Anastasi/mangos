@@ -1,0 +1,20 @@
+#!/sbin/openrc-run
+# Speech transcription: keeps Parakeet in memory (loading it takes many seconds) and
+# transcribes what mangos-transcribe sends it.
+
+description="Speech transcription"
+supervisor=supervise-daemon
+command=/usr/bin/mangos-parakeet
+command_args=8178
+output_log=/var/log/mangos-parakeet.log
+error_log=/var/log/mangos-parakeet.log
+respawn_delay=3
+# A configuration that cannot work stops the service instead of restarting it for ever.
+respawn_max=5
+respawn_period=60
+
+start_pre() {
+	# With the transcription in the cloud the model is not needed.
+	grep -q '^[[:space:]]*speech[[:space:]]*=[[:space:]]*cloud[[:space:]]*$' /etc/mangos/voice 2>/dev/null && return 0
+	[ -s /opt/mangos/asr/parakeet-v3/encoder-model.int8.onnx ] || { eerror "Parakeet is missing from /opt/mangos/asr/parakeet-v3"; return 1; }
+}

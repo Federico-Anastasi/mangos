@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+# mangOS camera: keeps the compute libraries loaded (loading them is slow) and takes the
+# photos requested through the mangos-photo command.
+
+description="Camera: takes the photos requested by the mangos-photo command"
+supervisor=supervise-daemon
+command=/usr/bin/mangos-photo
+command_args="--service"
+output_log=/var/log/mangos-photo.log
+error_log=/var/log/mangos-photo.log
+respawn_delay=5
+respawn_max=0
+
+depend() {
+	need localmount
+}

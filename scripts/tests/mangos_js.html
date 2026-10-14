@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<!-- Test page for mangos.js: shown on the phone with
+       pim show mangos_js.html full     (after copying it there)
+     it vibrates once, shows the accelerometer and the compass as they arrive, and how many
+     samples a second come through. Read the screen with phone_look.sh. -->
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prova di mangos.js</title>
+<style>
+  body { margin: 0; background: #101418; color: #e8e8e8; font: 5vw/1.5 sans-serif; padding: 24vw 6vw 6vw; }
+  b { color: #7fd1b9; }
+</style>
+<script src="/mangos.js"></script>
+</head>
+<body>
+<div>vibrazione: <b id="vibrate">…</b></div>
+<div>accelerometro: <b id="accel">…</b></div>
+<div>campioni al secondo: <b id="rate">…</b></div>
+<div>bussola: <b id="compass">…</b></div>
+<div>evento devicemotion: <b id="event">…</b></div>
+<script>
+  function show(id, text) { document.getElementById(id).textContent = text; }
+  function fmt(v) { return [v.x, v.y, v.z].map(function (n) { return n.toFixed(2); }).join('  '); }
+  mangos.vibrate(150).then(function () { show('vibrate', 'ok'); }, function (e) { show('vibrate', 'errore: ' + e.message); });
+  var count = 0, since = performance.now();
+  mangos.motion(function (a) {
+    count++;
+    show('accel', fmt(a));
+    var now = performance.now();
+    if (now - since > 2000) { show('rate', (count * 1000 / (now - since)).toFixed(0)); count = 0; since = now; }
+  }, 50);
+  mangos.compass(function (m) { show('compass', fmt(m)); }, 10);
+  window.addEventListener('devicemotion', function (e) { show('event', fmt(e.accelerationIncludingGravity)); });
+</script>
+</body>
+</html>

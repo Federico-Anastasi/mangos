@@ -1,0 +1,5 @@
+NAME="mangOS"
+ID=mangos
+ID_LIKE=alpine
+VERSION_ID=@VERSION@
+PRETTY_NAME="mangOS @VERSION@"

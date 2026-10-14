@@ -1,0 +1,13 @@
+diff --git a/drivers/misc/samsung/scsc/mx140_file.c b/drivers/misc/samsung/scsc/mx140_file.c
+index 4d9ad36c3..b02e87332 100644
+--- a/drivers/misc/samsung/scsc/mx140_file.c
++++ b/drivers/misc/samsung/scsc/mx140_file.c
+@@ -106,7 +106,7 @@ static char base_dir[] = CONFIG_SCSC_CORE_FW_LOCATION;  /* fixed in defconfig */
+ static char exe_dir[] = CONFIG_SCSC_CORE_TOOL_LOCATION;	/* fixed in defconfig */
+ #endif
+ 
+-static char base_dir_request_fw[] = "../etc/wifi";  /* fixed in defconfig */
++static char base_dir_request_fw[] = ".";  /* files sit directly in /lib/firmware */
+ 
+ static bool enable_auto_sense;
+ module_param(enable_auto_sense, bool, S_IRUGO | S_IWUSR);

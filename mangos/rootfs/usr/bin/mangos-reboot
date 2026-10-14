@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Reboots the phone, choosing where it restarts from.
+
+Usage: mangos-reboot [recovery|download]
+
+  (nothing)  normal boot, from the boot partition
+  recovery   boots the image kept in the recovery partition
+  download   download mode, the one in which the PC writes the partitions with heimdall
+
+It works if the kernel has the reboot_target module, which passes the choice to the bootloader.
+It must be run as root.
+"""
+import ctypes
+import os
+import subprocess
+import sys
+
+MODES = ("recovery", "download")
+SYS_REBOOT = 142                                  # syscall number on arm64
+MAGIC1, MAGIC2 = 0xFEE1DEAD, 672274793
+RESTART, RESTART_WITH_ARG = 0x01234567, 0xA1B2C3D4
+
+mode = sys.argv[1] if len(sys.argv) > 1 else None
+if len(sys.argv) > 2 or (mode is not None and mode not in MODES):
+    sys.exit(__doc__)
+if mode and not os.path.isdir("/sys/module/reboot_target"):
+    sys.exit(f"mangos-reboot: without the reboot_target module the bootloader would not know about {mode}")
+
+# The reboot goes straight to the kernel, because a normal shutdown could not tell it the mode:
+# the time, which a shutdown usually saves, is saved here.
+try:
+    subprocess.run(["rc-service", "local", "stop"], timeout=10)
+except (OSError, subprocess.TimeoutExpired) as error:
+    print(f"mangos-reboot: time not saved: {error}", file=sys.stderr)
+os.sync()
+libc = ctypes.CDLL(None, use_errno=True)
+if mode:
+    result = libc.syscall(SYS_REBOOT, MAGIC1, MAGIC2, RESTART_WITH_ARG, mode.encode())
+else:
+    result = libc.syscall(SYS_REBOOT, MAGIC1, MAGIC2, RESTART, None)
+sys.exit(f"mangos-reboot: reboot refused (error {ctypes.get_errno()})" if result else 0)

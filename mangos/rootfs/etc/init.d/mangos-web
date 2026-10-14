@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+# mangOS UI: the entity in the room, full screen.
+
+description="mangOS UI"
+supervisor=supervise-daemon
+command=/usr/bin/mangos-web
+output_log=/var/log/mangos-web.log
+error_log=/var/log/mangos-web.log
+respawn_delay=2
+respawn_max=0
+
+depend() {
+	need localmount mangos-bridge
+	after bootmisc udev-trigger
+}

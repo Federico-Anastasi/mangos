@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+# mangOS agent: passes what the person writes to Claude Code and shows the reply.
+
+description="Entity agent"
+supervisor=supervise-daemon
+command=/usr/bin/mangos-agent
+output_log=/var/log/mangos-agent.log
+error_log=/var/log/mangos-agent.log
+respawn_delay=3
+respawn_max=0
+
+depend() {
+	need mangos-bridge
+}

@@ -1,0 +1,26 @@
+diff --git a/drivers/misc/samsung/scsc/mifintrbit.c b/drivers/misc/samsung/scsc/mifintrbit.c
+index ad980dc1e..021b8023f 100644
+--- a/drivers/misc/samsung/scsc/mifintrbit.c
++++ b/drivers/misc/samsung/scsc/mifintrbit.c
+@@ -25,13 +25,6 @@ static void mifintrbit_default_handler(int irq, void *data)
+ 	spin_unlock_irqrestore(&intr->spinlock, flags);
+ }
+ 
+-static void print_bitmaps(struct mifintrbit *intr)
+-{
+-	SCSC_TAG_ERR(MIF, "tohost 0x%lx fromhost_r4 0x%lx fromhost_m4 0x%lx\n",
+-		     intr->bitmap_tohost[0], intr->bitmap_fromhost_r4[0],
+-		     intr->bitmap_fromhost_m4[0]);
+-}
+-
+ static void mifiintrman_isr(int irq, void *data)
+ {
+ 	struct mifintrbit *intr = (struct mifintrbit *)data;
+@@ -45,7 +38,6 @@ static void mifiintrman_isr(int irq, void *data)
+ 	spin_lock_irqsave(&intr->spinlock, flags);
+ 	irq_reg = intr->mif->irq_get(intr->mif);
+ 
+-	print_bitmaps(intr);
+ 	for_each_set_bit(bit, &irq_reg, MIFINTRBIT_NUM_INT) {
+ 		if (intr->mifintrbit_irq_handler[bit] != mifintrbit_default_handler)
+ 			intr->mifintrbit_irq_handler[bit](bit, intr->irq_data[bit]);

@@ -1,0 +1,117 @@
+#!/bin/busybox sh
+# First mangOS program: sets up the USB network, mounts the system on userdata and hands over.
+#
+# Userdata holds a GPT with two partitions (boot and system). mangOS lives in the /mangos
+# directory of the system partition, next to postmarketOS, which stays as the fallback system.
+# mangOS starts if it exists and its previous boot completed; otherwise the fallback does.
+
+/bin/busybox --install -s /bin
+export PATH=/bin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /sysroot /run
+mount -t devpts devpts /dev/pts
+
+# The kernel clears the screen when it takes over the framebuffer: the logo is redrawn and stays
+# until the UI is ready.
+[ -e /dev/fb0 ] && zcat /splash.raw.gz > /dev/fb0 2>/dev/null
+
+LOG=/run/initramfs.log
+log() { echo "[$(cut -d' ' -f1 /proc/uptime)] $*" >> "$LOG"; }
+
+rescue() {
+    log "ERROR: $*"
+    # With no system to boot, a root shell without a password stays on the USB network: nc 172.16.42.1 23
+    cat "$LOG" > /dev/tty0 2>/dev/null
+    nc -lk -p 23 -e /bin/sh
+    while true; do sleep 3600; done
+}
+
+usb_network() {
+    mount -t configfs none /sys/kernel/config || return 1
+    g=/sys/kernel/config/usb_gadget/g1
+    mkdir -p "$g/strings/0x409" "$g/functions/ncm.usb0" "$g/configs/c.1/strings/0x409" || return 1
+    echo 0x18d1 > "$g/idVendor"
+    echo 0xd001 > "$g/idProduct"
+    echo mangOS > "$g/strings/0x409/manufacturer"
+    echo mangOS > "$g/strings/0x409/product"
+    echo mangos > "$g/strings/0x409/serialnumber"
+    # Fixed addresses: otherwise they change at every boot and the computer sees a new adapter each time.
+    echo 02:4d:61:6e:67:01 > "$g/functions/ncm.usb0/dev_addr"
+    echo 02:4d:61:6e:67:02 > "$g/functions/ncm.usb0/host_addr"
+    echo NCM > "$g/configs/c.1/strings/0x409/configuration"
+    ln -s "$g/functions/ncm.usb0" "$g/configs/c.1/"
+    ls /sys/class/udc > "$g/UDC" || return 1
+    ifconfig usb0 172.16.42.1 netmask 255.255.255.0 up
+}
+
+find_userdata() {
+    for i in $(seq 1 50); do
+        for u in /sys/class/block/*/uevent; do
+            if grep -q '^PARTNAME=userdata$' "$u"; then
+                echo "/dev/$(basename "$(dirname "$u")")"
+                return 0
+            fi
+        done
+        sleep 0.1
+    done
+    return 1
+}
+
+# Byte offset of GPT partition number $2 inside device $1 (512-byte sectors).
+gpt_offset() {
+    entry=$(( 2 * 512 + ($2 - 1) * 128 + 32 ))
+    lba=$(dd if="$1" bs=1 skip="$entry" count=4 2>/dev/null | hexdump -e '1/4 "%u"')
+    [ "${lba:-0}" -gt 0 ] && echo $(( lba * 512 ))
+}
+
+usb_network && log "USB network ready" || log "USB network unavailable"
+
+USERDATA=$(find_userdata) || rescue "userdata partition not found"
+ROOT_OFFSET=$(gpt_offset "$USERDATA" 2) || rescue "partition table on userdata not readable"
+BOOT_OFFSET=$(gpt_offset "$USERDATA" 1)
+losetup -o "$ROOT_OFFSET" /dev/loop0 "$USERDATA" || rescue "losetup of the system partition failed"
+
+# File system check before mounting. Normally quick: it replays the journal and, if the file
+# system is marked clean, does nothing else. If it finds errors it cannot fix on its own (exit code
+# 4 or higher) it runs again answering yes to everything: a phone must boot with nobody in front
+# of it. The exit code ends up in /var/log/initramfs.log.
+e2fsck -p /dev/loop0 > /run/e2fsck.log 2>&1
+fsck_status=$?
+if [ "$fsck_status" -ge 4 ]; then
+    log "e2fsck: errors not repaired automatically (exit code $fsck_status), running full repair"
+    e2fsck -y /dev/loop0 >> /run/e2fsck.log 2>&1
+    fsck_status=$?
+fi
+log "e2fsck: exit code $fsck_status ($(tail -n 1 /run/e2fsck.log))"
+
+mount -t ext4 /dev/loop0 /sysroot || rescue "mounting the system partition failed"
+
+PENDING=/sysroot/mangos/.boot-pending
+if [ -x /sysroot/mangos/bin/busybox ] && [ ! -e "$PENDING" ] && [ ! -e /sysroot/mangos/.disabled ]; then
+    # mangOS removes this marker when it reaches the end of boot: finding it here means the
+    # previous boot did not succeed, and the fallback starts.
+    : > "$PENDING"
+    log "booting mangOS"
+    mkdir -p /newroot
+    mount --bind /sysroot/mangos /newroot
+    mkdir -p /newroot/mnt/fallback /newroot/run
+    mount --move /sysroot /newroot/mnt/fallback
+    NEWROOT=/newroot
+else
+    [ -e "$PENDING" ] && log "mangOS did not complete the previous boot" && rm -f "$PENDING"
+    log "booting the fallback system"
+    if [ -n "$BOOT_OFFSET" ] && losetup -o "$BOOT_OFFSET" /dev/loop1 "$USERDATA"; then
+        mount /dev/loop1 /sysroot/boot 2>/dev/null || log "fallback boot partition not mounted"
+    fi
+    NEWROOT=/sysroot
+fi
+
+mkdir -p "$NEWROOT/var/log"
+cp "$LOG" "$NEWROOT/var/log/initramfs.log" 2>/dev/null
+umount /sys/kernel/config 2>/dev/null
+mount --move /dev "$NEWROOT/dev"
+umount /proc /sys
+exec switch_root "$NEWROOT" /sbin/init

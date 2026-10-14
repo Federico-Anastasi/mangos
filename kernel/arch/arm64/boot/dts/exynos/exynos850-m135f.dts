@@ -1,0 +1,267 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * SM-M135F (Galaxy M13, board "M13 EUR OPEN REV02", 4 GB RAM): the A135F
+ * description plus what this board needs on top of it: memory map, Himax
+ * HX83112F touchscreen, SM5714 charger and fuel gauge, S2DPS01 backlight,
+ * speaker amplifier bus, the two camera sensors and their frame memory.
+ */
+
+/dts-v1/;
+
+#include "exynos850-a135f-common.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "SM-M135F";
+	compatible = "samsung,m135f", "samsung,exynos850";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	memory@80000000 {
+		device_type = "memory";
+		/*
+		 * The first block ends at 0xbc400000, not at 0xbc900000 as on the
+		 * A135F: on this board the 5 MiB above read back as zeroes whatever
+		 * is written, so using them silently loses data.
+		 */
+		reg = <0x0 0x80000000 0x0 0x3c400000>,
+		      /* Memory hole */
+		      <0x0 0xc0000000 0x0 0x20000000>,
+		      /* Memory hole */
+		      <0x0 0xe0d00000 0x0 0x1f300000>,
+		      /* Memory hole - last block */
+		      <0x8 0x80000000 0x0 0x80000000>;
+	};
+};
+
+/ {
+	chosen {
+		/*
+		 * The *_ignore_unused options keep on what the bootloader left
+		 * powered and clocked: the abox, chub and camera modules rely on
+		 * it, and reading the registers of a switched-off block hangs the
+		 * kernel. quiet, loglevel=0 and fbcon=map:1 keep the text console
+		 * off the panel so the boot splash stays until the compositor draws;
+		 * messages remain available through dmesg.
+		 */
+		bootargs = "clk_ignore_unused pd_ignore_unused regulator_ignore_unused quiet loglevel=0 fbcon=map:1";
+	};
+};
+
+/*
+ * The power management firmware cannot report the CPU rates. The bootloader
+ * leaves both clusters at 1053 MHz: request it at start, so the ACPM clocks
+ * have a real rate when cpufreq reads them.
+ */
+&acpm_ipc {
+	assigned-clocks = <&acpm_ipc EXYNOS850_CLK_ACPM_DVFS_CPUCL0>,
+			  <&acpm_ipc EXYNOS850_CLK_ACPM_DVFS_CPUCL1>;
+	assigned-clock-rates = <1053000000>, <1053000000>;
+};
+
+/*
+ * Watchdog of the first CPU cluster. It stays off until something opens
+ * /dev/watchdog; once started, a hang ends in a reset instead of a dead phone.
+ */
+&watchdog_cl0 {
+	status = "okay";
+};
+
+/*
+ * Shared memory of the Wi-Fi/Bluetooth subsystem: the common dtsi writes size
+ * and allocation range with one size cell, but reserved-memory uses two, and
+ * the region is dropped ("invalid size property in 'wifibt-if' node"). The
+ * driver needs it below 4 GiB.
+ */
+&wifibt_if {
+	size = <0x0 0xc00000>;
+	alloc-ranges = <0x0 0x80000000 0x0 0x80000000>;
+};
+
+/*
+ * Same problem for the Wi-Fi/Bluetooth subsystem and its system controller
+ * windows: they sit at the root, where this board uses two size cells, with
+ * one-size-cell reg values ("Error getting mem resource for MAILBOX_WLBT").
+ */
+&syscon_i3c_apm_pmic {
+	reg = <0x0 0x11a50000 0x0 0x1800>;
+};
+
+&syscon_dbus_baaw {
+	reg = <0x0 0x14c20000 0x0 0x300>;
+};
+
+&syscon_pbus_baaw {
+	reg = <0x0 0x14c30000 0x0 0x300>;
+};
+
+&syscon_wlbt_remap {
+	reg = <0x0 0x14c50000 0x0 0x500>;
+};
+
+&syscon_boot_cfg {
+	reg = <0x0 0x14c60000 0x0 0x1200>;
+};
+
+&wlbt {
+	reg = <0x0 0x119c0000 0x0 0x180>;
+};
+
+/* Panel and touch controller logic supply: never let a consumer switch it off. */
+&vdd_ldo28 {
+	regulator-always-on;
+};
+
+/* No external pull-ups on this bus: without the internal ones it never goes idle. */
+&i2c0_pins {
+	samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
+};
+
+&i2c_0 {
+	status = "okay";
+
+	charger@49 {
+		compatible = "siliconmitus,sm5714";
+		reg = <0x49>;
+	};
+};
+
+&i2c_1 {
+	status = "okay";
+
+	backlight@66 {
+		compatible = "samsung,s2dps01";
+		reg = <0x66>;
+	};
+};
+
+/* Speaker amplifier (Silicon Mitus SMA1303 at 0x1e), driven by the abox module. */
+&i2c_3 {
+	status = "okay";
+};
+
+/*
+ * Rear camera sensor (Samsung S5KJN1 at 0x2d). Supplies come from the S2MPB03
+ * on i2c_5. The master clock (CIS_CLK0, 26 MHz on gpc0-0) has no clock driver:
+ * the camera module switches it on by hand, which is why the node is not
+ * "samsung,s5kjn1".
+ */
+&usi_hsi2c_1 {
+	status = "okay";
+};
+
+/*
+ * Rear camera focus motor (Dongwoon DW9808 at 0x0c). The camera module creates the client
+ * itself.
+ */
+&usi_hsi2c_0 {
+	status = "okay";
+};
+
+&hsi2c_0 {
+	status = "okay";
+	clock-frequency = <400000>;
+};
+
+/*
+ * Front camera sensor (GalaxyCore GC08A3 at 0x31). Master clock on gpc0-1,
+ * reset on gpa2-4; gpg2-5 selects which sensor reaches the receiver.
+ */
+&usi_hsi2c_2 {
+	status = "okay";
+};
+
+&hsi2c_2 {
+	status = "okay";
+	clock-frequency = <400000>;
+
+	camera@31 {
+		compatible = "mangos,gc08a3";
+		reg = <0x31>;
+		vddio-supply = <&s2mpb03_ldo3>;
+		vddd-supply = <&s2mpb03_ldo2>;
+		vdda-supply = <&s2mpb03_ldo6>;
+		reset-gpios = <&gpa2 4 GPIO_ACTIVE_LOW>;
+		select-gpios = <&gpg2 5 GPIO_ACTIVE_HIGH>;
+		pinctrl-0 = <&sensor_mclk1_fn_pins>;
+		pinctrl-names = "default";
+		memory-region = <&camera_mem>;
+	};
+};
+
+&hsi2c_1 {
+	status = "okay";
+	clock-frequency = <400000>;
+
+	camera@2d {
+		compatible = "mangos,s5kjn1";
+		reg = <0x2d>;
+		vddaf-supply = <&s2mpb03_ldo7>;
+		vddio-supply = <&s2mpb03_ldo3>;
+		vddd-supply = <&s2mpb03_ldo1>;
+		vdda-supply = <&s2mpb03_ldo5>;
+		reset-gpios = <&gpa2 3 GPIO_ACTIVE_LOW>;
+		pinctrl-0 = <&sensor_mclk0_fn_pins>;
+		pinctrl-names = "default";
+		memory-region = <&camera_mem>;
+	};
+};
+
+/*
+ * Frame memory for the camera receiver, which writes to physical addresses
+ * (its IOMMU is not enabled) through a 32-bit register: contiguous and below
+ * 4 GiB. The default contiguous area is 32 MiB and mostly taken by the audio
+ * firmware. Reusable: the system uses it while the camera is idle.
+ */
+&{/reserved-memory} {
+	camera_mem: camera {
+		compatible = "shared-dma-pool";
+		reusable;
+		size = <0x0 0x2000000>;
+		alignment = <0x0 0x400000>;
+		alloc-ranges = <0x0 0x80000000 0x0 0x80000000>;
+	};
+};
+
+&pinctrl_alive {
+	ts_int: ts-int-pins {
+		samsung,pins = "gpa0-0";
+		samsung,pin-function = <EXYNOS_PIN_FUNC_EINT>;
+		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
+	};
+
+	ts_reset: ts-reset-pins {
+		samsung,pins = "gpa3-0";
+		samsung,pin-pud = <EXYNOS_PIN_PULL_NONE>;
+	};
+};
+
+&spi_1 {
+	/* Without DMA: with it the firmware download times out on the second block. */
+	/delete-property/ dmas;
+	/delete-property/ dma-names;
+
+	/delete-node/ touchscreen@0;
+
+	/*
+	 * In-cell controller sharing the panel supplies, which the bootloader
+	 * leaves on; it has no supply of its own to switch.
+	 */
+	touchscreen@0 {
+		compatible = "himax,hx83112f";
+		reg = <0>;
+		spi-max-frequency = <10000000>;
+		spi-cpol;
+		spi-cpha;
+
+		interrupt-parent = <&gpa0>;
+		interrupts = <0 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&gpa3 0 GPIO_ACTIVE_LOW>;
+
+		pinctrl-0 = <&ts_int &ts_reset>;
+		pinctrl-names = "default";
+
+		touchscreen-size-x = <1080>;
+		touchscreen-size-y = <2408>;
+	};
+};

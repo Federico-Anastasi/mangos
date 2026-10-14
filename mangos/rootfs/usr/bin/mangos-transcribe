@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""mangos-transcribe: from speech to text, on the phone or in the cloud.
+
+  mangos-transcribe listen [--send]   reads raw audio from the input (16 kHz, mono, 16 bit, little
+                                      endian), waits for someone to speak, and transcribes the
+                                      phrase until it ends
+
+Without --send it prints the text. With --send it delivers it to the entity through the bridge,
+as if the person had typed it, and tells the UI how far along it is (listening, transcribing,
+nothing). While the person speaks the UI also receives the text heard so far ("heard").
+
+Who transcribes, the mangos-parakeet service on the phone or Deepgram's Nova-3 in the cloud (key
+in /etc/mangos/deepgram-key), is chosen with `pim speech`. If the one chosen does not answer,
+mangos-transcribe stops with an error: it does not switch to the other. Locally the phrase ends
+after 800 ms of silence, and each piece of speech is transcribed only once; in the cloud the audio
+is streamed while the person speaks, and Deepgram says when the phrase is over.
+
+Exit code: 0 text delivered or printed; 3 nothing to deliver (nobody spoke, or no word was
+understood); 4 Deepgram cannot be reached; 5 the Deepgram key is missing or refused; 6 the
+microphone gives no audio; 1 any other failure. The bridge tells the person which.
+"""
+import array
+import io
+import json
+import math
+import os
+import sys
+import threading
+import urllib.error
+import urllib.request
+import wave
+
+BRIDGE = "http://127.0.0.1:8098"
+PARAKEET_PORT = 8178         # the mangos-parakeet service
+SETTINGS = "/etc/mangos/voice"
+CLOUD_KEY = "/etc/mangos/deepgram-key"
+# keyterm: names the model does not know and must hear right.
+CLOUD_STREAM = ("wss://api.deepgram.com/v1/listen?model=nova-3&language=it&punctuate=true"
+                "&keyterm=PIM&keyterm=mangOS&encoding=linear16&sample_rate=16000"
+                "&interim_results=true&utterance_end_ms=1000"
+                "&endpointing=400")    # the pause, in ms, after which Deepgram ends the phrase
+CLOUD_SEND = 5               # windows of audio sent together (100 ms)
+CLOUD_LAST_WORDS_S = 3       # after the input ends, how long the last words may take to arrive
+SAMPLE_RATE = 16000
+NO_SPEECH = 3                # exit code: for the bridge it is not a failure
+NO_NETWORK = 4               # exit code: Deepgram cannot be reached
+KEY_REFUSED = 5              # exit code: the Deepgram key is missing or refused
+NO_AUDIO = 6                 # exit code: the input ended before any sound
+
+# Phrase cutting: 20 ms windows.
+WINDOW = SAMPLE_RATE // 50
+MIN_THRESHOLD = 100          # mean amplitude below which it is silence anyway (out of 32768)
+ABOVE_NOISE = 2.5            # speech must exceed the background noise by this factor
+START_AFTER = 5              # consecutive speech windows to say "is speaking" (100 ms)
+END_AFTER = 40               # consecutive silent windows to say "has finished" (800 ms)
+PRE_ROLL = 25                # windows kept before the start, so the first syllable is not eaten
+MAX_WAIT_S = 8               # if nobody speaks within this time we give up
+MAX_PHRASE_S = 30            # a longer phrase is cut here: it is the model's limit
+MARGIN = 5                   # silent windows left around the speech of a segment (100 ms)
+PHRASE_PAUSE = 15            # consecutive silent windows that end a phrase (300 ms)
+SEGMENT_S = 8                # without long pauses, a tail longer than this is fixed at the first pause:
+                             # cutting mid-phrase makes the model err more, so as late as possible
+TIMEOUT_S = 40               # beyond this the transcription service is considered stuck
+NOISE_WORDS = {"yeah", "mm", "mhm", "hmm", "uh", "um"}     # what the model "hears" in noise
+
+
+def call_bridge(path, body):
+    request = urllib.request.Request(BRIDGE + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(request, timeout=5).read()
+
+
+def fail(code, message):
+    print(f"mangos-transcribe: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def rms(samples):
+    return math.sqrt(sum(c * c for c in samples) / len(samples))
+
+
+def read_pairs(path):
+    """Reads a file of key=value lines; lines starting with # are comments."""
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                key, equals, value = line.partition("=")
+                if equals and not key.lstrip().startswith("#"):
+                    values[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return values
+
+
+def speech_in_cloud():
+    return read_pairs(SETTINGS).get("speech") == "cloud"
+
+
+def cloud_key():
+    try:
+        with open(CLOUD_KEY, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError as error:
+        fail(KEY_REFUSED, f"no Deepgram key ({error})")
+
+
+class SpeechDetector:
+    """Tells speech from the background noise, one window at a time."""
+
+    def __init__(self):
+        self.noise_floor = None
+
+    def is_speech(self, window, speaking):
+        level = rms(window)
+        # The noise floor is the lowest level heard, allowed to rise slowly (it doubles in three
+        # seconds) and only while nobody speaks: so it follows a room getting noisier, but a long
+        # phrase does not become "noise" and get cut in half.
+        # The mic's first third of a second is absolute zero (it starts muted): not the floor.
+        if level and (self.noise_floor is None or level < self.noise_floor):
+            self.noise_floor = level
+        elif self.noise_floor and not speaking:
+            self.noise_floor = self.noise_floor * 1.005
+        return level > max(MIN_THRESHOLD, (self.noise_floor or 0) * ABOVE_NOISE)
+
+
+class ChunkedTranscription(threading.Thread):
+    """Transcribes the phrase while the person speaks and gives `show` the text fixed so far.
+
+    The phrase is split in two: the fixed part, already transcribed and no longer changing, and
+    the tail. When the tail exceeds a few seconds it is cut at the last pause and what lies
+    before the cut is fixed. So each pass works on a few seconds, however long the phrase. The
+    tail is not transcribed while it grows: the model would be busy exactly when the phrase
+    ends."""
+
+    def __init__(self, show):
+        super().__init__(daemon=True)
+        self.show = show
+        self.phrase = None           # the phrase's windows, as they arrive
+        self.voiced = []             # for each window, whether there was speech
+        self.fixed_until = 0         # how many windows are already transcribed
+        self.fixed = ""              # their text
+        self.done = threading.Event()
+
+    def cut_point(self, end):
+        """Where to fix: the last silent window that leaves at least a second and a half of
+        segment before it and a second of tail after. Without pauses, and with a tail already
+        twice as long, it cuts anyway one second from the end."""
+        tail = end - self.fixed_until
+        # A long pause is the end of a phrase: cutting there breaks nothing, and it is fixed at
+        # once, however short the segment (as long as it had speech in it).
+        if tail > PHRASE_PAUSE and not any(self.voiced[end - PHRASE_PAUSE:end]) \
+                and sum(self.voiced[self.fixed_until:end]) >= START_AFTER:
+            return end - PHRASE_PAUSE // 2
+        if tail * WINDOW < SEGMENT_S * SAMPLE_RATE:
+            return None
+        for i in range(end - SAMPLE_RATE // WINDOW, self.fixed_until + int(1.5 * SAMPLE_RATE / WINDOW), -1):
+            if not self.voiced[i]:
+                return i
+        return end - SAMPLE_RATE // WINDOW if tail * WINDOW > 2 * SEGMENT_S * SAMPLE_RATE else None
+
+    def samples_between(self, start, end):
+        """The samples of windows `start` to `end`, trimmed around the speech: with silence at
+        the end the model gets short phrases wrong."""
+        speech = [i for i in range(start, min(end, len(self.voiced))) if self.voiced[i]]
+        if speech:
+            start, end = max(start, speech[0] - MARGIN), min(end, speech[-1] + 1 + MARGIN)
+        joined = array.array("h")
+        for window in self.phrase[start:end]:
+            joined.extend(window)
+        return joined
+
+    def run(self):
+        while not self.done.wait(0.05):
+            end = min(len(self.phrase), len(self.voiced))
+            cut = self.cut_point(end)
+            if cut:
+                text = transcribe(self.samples_between(self.fixed_until, cut))
+                self.fixed = (self.fixed + " " + text).strip()
+                self.fixed_until = cut
+                self.show(self.fixed)
+
+    def halt(self):
+        """Phrase over: waits for the transcription in progress."""
+        self.done.set()
+        if self.is_alive():
+            self.join()
+
+    def finish(self):
+        """Stops the thread and transcribes the tail. Returns all the text."""
+        self.halt()
+        if not any(self.voiced[self.fixed_until:]):
+            return self.fixed                    # after the last fixed segment there is only silence
+        tail = self.samples_between(self.fixed_until, len(self.phrase))
+        return (self.fixed + " " + transcribe(tail)).strip()
+
+
+def cut_phrase(source, transcription=None):
+    """Reads windows from the input until it finds a phrase: returns its samples, or None if
+    nobody spoke. If there is a `transcription` it is given the phrase as it grows."""
+    detector, pre_roll, phrase = SpeechDetector(), [], []
+    speech_run = silence_run = read = 0
+    speaking = False
+    while True:
+        block = source.read(WINDOW * 2)
+        if len(block) < WINDOW * 2:
+            if not read:
+                fail(NO_AUDIO, "no audio from the microphone")
+            break                                   # the input ended
+        window = array.array("h", block)
+        read += 1
+        is_speech = detector.is_speech(window, speaking)
+        if not speaking:
+            pre_roll = (pre_roll + [window])[-PRE_ROLL:]
+            speech_run = speech_run + 1 if is_speech else 0
+            if speech_run >= START_AFTER:
+                speaking, phrase = True, pre_roll
+                if transcription:
+                    transcription.phrase = phrase
+                    transcription.voiced = [True] * len(phrase)
+                    transcription.start()
+            elif read * WINDOW > MAX_WAIT_S * SAMPLE_RATE:
+                return None
+        else:
+            phrase.append(window)
+            if transcription:
+                transcription.voiced.append(is_speech)
+            silence_run = 0 if is_speech else silence_run + 1
+            if silence_run >= END_AFTER or len(phrase) * WINDOW >= MAX_PHRASE_S * SAMPLE_RATE:
+                break
+    if not speaking:
+        return None
+    samples = array.array("h")
+    for window in phrase:
+        samples.extend(window)
+    return samples
+
+
+def to_wav(samples):
+    """The samples as a WAV file, in memory."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(SAMPLE_RATE)
+        out.writeframes(samples.tobytes())
+    return buffer.getvalue()
+
+
+def transcribe(samples):
+    """The text spoken in the samples, transcribed by the mangos-parakeet service."""
+    request = urllib.request.Request(f"http://127.0.0.1:{PARAKEET_PORT}/transcribe", data=to_wav(samples),
+                                     headers={"Content-Type": "audio/wav"})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT_S) as response:
+            text = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        sys.exit("mangos-transcribe: " + error.read().decode("utf-8", "replace").strip())
+    except OSError as error:
+        sys.exit(f"mangos-transcribe: mangos-parakeet not answering ({error}): is the service started?")
+    return " ".join(text.split())
+
+
+def listen_cloud(source, show):
+    """Streams the input to Deepgram until it says the phrase is over. Returns the text, or None
+    if nobody spoke. `show`, if given, receives the text heard so far."""
+    from websockets.exceptions import ConnectionClosed, WebSocketException
+    from websockets.sync.client import connect
+    try:
+        # close_timeout: the text is delivered only after the close, which must not wait for Deepgram.
+        stream = connect(CLOUD_STREAM, additional_headers={"Authorization": f"Token {cloud_key()}"},
+                         open_timeout=10, close_timeout=0.3)
+    except WebSocketException as error:
+        # The handshake answer of a refused key is an HTTP 401 or 403.
+        if getattr(getattr(error, "response", error), "status_code", None) in (401, 403):
+            fail(KEY_REFUSED, f"Deepgram refused the key ({error})")
+        sys.exit(f"mangos-transcribe: Deepgram not answering ({error})")
+    except OSError as error:
+        fail(NO_NETWORK, f"Deepgram not reachable ({error})")
+    fixed, interim = [], [""]       # the final pieces; the piece still changing
+    over = threading.Event()        # the phrase is over, or the connection closed
+    closed = threading.Event()      # the connection closed (by Deepgram, or by us at the end)
+
+    def receive():
+        try:
+            for raw in stream:
+                message = json.loads(raw)
+                if message.get("type") == "Results":
+                    text = message["channel"]["alternatives"][0]["transcript"].strip()
+                    if message.get("is_final"):
+                        if text:
+                            fixed.append(text)
+                        interim[0] = ""
+                        # speech_final: a pause after the speech. Without words it was noise.
+                        if message.get("speech_final") and fixed:
+                            over.set()
+                    else:
+                        interim[0] = text
+                    if show and (text or message.get("is_final")):
+                        show(" ".join(fixed + interim).strip())
+                elif message.get("type") == "UtteranceEnd" and fixed:
+                    over.set()      # the backup end, when the pause was too noisy for speech_final
+        except (ConnectionClosed, ValueError):
+            pass
+        closed.set()
+        over.set()
+
+    receiver = threading.Thread(target=receive, daemon=True)
+    receiver.start()
+    detector, batch = SpeechDetector(), bytearray()
+    speaking, speech_run, read, started = False, 0, 0, 0
+    lost = False
+    try:
+        while not over.is_set():
+            block = source.read(WINDOW * 2)
+            if len(block) < WINDOW * 2:
+                if not read:
+                    fail(NO_AUDIO, "no audio from the microphone")
+                break                                   # the input ended
+            read += 1
+            batch += block
+            if len(batch) >= CLOUD_SEND * WINDOW * 2:
+                stream.send(bytes(batch))
+                batch.clear()
+            # Our own detector only answers "is anyone speaking", for the waits: the end of the
+            # phrase is Deepgram's.
+            is_speech = detector.is_speech(array.array("h", block), speaking)
+            if not speaking:
+                speech_run = speech_run + 1 if is_speech else 0
+                if speech_run >= START_AFTER:
+                    speaking, started = True, read
+                elif read * WINDOW > MAX_WAIT_S * SAMPLE_RATE and not (fixed or interim[0]):
+                    break                               # nobody spoke
+            elif (read - started) * WINDOW >= MAX_PHRASE_S * SAMPLE_RATE:
+                break
+        # Deepgram closed before saying the phrase was over: the words, if any, are not to trust.
+        lost = closed.is_set() and not fixed
+        if not over.is_set():
+            # Ended here, not by Deepgram: it gives what it still has.
+            stream.send(json.dumps({"type": "Finalize"}))
+            over.wait(CLOUD_LAST_WORDS_S)
+        stream.send(json.dumps({"type": "CloseStream"}))
+    except (ConnectionClosed, OSError):
+        pass                                            # the words arrived so far stay valid
+    finally:
+        stream.close()
+    if lost:
+        reason = stream.close_reason or "no reason given"
+        sys.exit(f"mangos-transcribe: Deepgram closed the stream ({stream.close_code}: {reason})")
+    text = " ".join(fixed).strip()
+    return text if text or speaking else None
+
+
+def main():
+    args = [a for a in sys.argv[1:] if a != "--send"]
+    send = "--send" in sys.argv[1:]
+
+    def report(state, **extra):
+        if send:
+            try:
+                call_bridge("/command", {"type": "voice", "state": state, **extra})
+            except OSError as error:
+                print(f"mangos-transcribe: bridge not answering ({error})", file=sys.stderr, flush=True)
+
+    def nothing(reason):
+        report("nothing")
+        print(f"mangos-transcribe: {reason}", file=sys.stderr)
+        sys.exit(NO_SPEECH)
+
+    cloud = speech_in_cloud()
+    show = (lambda text: report("heard", text=text)) if send else None
+    transcription = None
+    text = None
+    if args == ["listen"] and cloud:
+        report("listening")
+        text = listen_cloud(sys.stdin.buffer, show)
+        # Once the input is closed, whatever feeds the audio stops: the mic does not stay on.
+        os.close(sys.stdin.fileno())
+        if text is None:
+            nothing("nobody spoke")
+    elif args == ["listen"]:
+        report("listening")
+        if send:
+            transcription = ChunkedTranscription(show)
+        samples = cut_phrase(sys.stdin.buffer, transcription)
+        # Once the input is closed, whatever feeds the audio stops: the mic does not stay on
+        # while transcribing.
+        os.close(sys.stdin.fileno())
+        if samples is None:
+            nothing("nobody spoke")
+    else:
+        sys.exit(__doc__)
+
+    if text is None:
+        report("transcribing")
+        if transcription:
+            text = transcription.finish()
+        else:
+            text = transcribe(samples)
+    # From the sound of an empty room alone Parakeet pulls out a noise word ("Yeah."): not a phrase.
+    if text.strip(" .,!?").lower() in NOISE_WORDS:
+        text = ""
+    if not text:
+        nothing("no word recognized")
+    if send:
+        report("done", text=text)
+        # "by_voice": whoever replies knows the person spoke, and can reply by speaking.
+        call_bridge("/user", {"type": "text", "text": text, "by_voice": True})
+    else:
+        print(text)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1266 @@
+<!doctype html>
+<html lang="it" translate="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mangOS</title>
+<!--
+  mangOS UI: the room, the entity that lives in it, the status bar, the keyboard, the
+  microphone and the window for the pages made by the entity. It is served by mangos-bridge,
+  which sends it the events and which it asks for the status, the furnishing and the pages.
+
+  Three stacked WebGL canvases, because the GPU is small:
+    room    full screen, low resolution, redrawn only when needed;
+    smoke   the entity's body, low resolution, redrawn every frame (every other one when nothing happens);
+    eyes    eyes and eyebrows, at a higher resolution because they must be sharp.
+  Smoke and eyes sit in a box that moves and scales with a CSS transform, without redrawing.
+-->
+<style>
+@font-face { font-family: "Inter"; src: url("fonts/Inter-Regular.ttf"); font-weight: 400; }
+@font-face { font-family: "Inter"; src: url("fonts/Inter-SemiBold.ttf"); font-weight: 600; }
+:root { --text: #F1F0EB; --gray: #8F8E88; --bg: #050507; color-scheme: dark; }
+html, body { height: 100%; margin: 0; overflow: hidden; background: var(--bg); color: var(--text);
+  font-family: "Inter", sans-serif; -webkit-user-select: none; user-select: none; cursor: none; }
+/* A finger does not scroll or zoom the room; it scrolls only inside the pages window. */
+#room, #objects, #entity, #statusbar, #lines, #compose, #voice, #pages, #keyboard, #blackout { touch-action: none; }
+#room { position: absolute; inset: 0; width: 100%; height: 100%; }
+#objects { position: absolute; inset: 0; pointer-events: none; perspective-origin: 50% 50%; overflow: hidden; }
+#objects img { position: absolute; transform-origin: 0 0; backface-visibility: hidden; }
+#entity { position: absolute; left: 0; top: 0; transform-origin: 50% 50%; will-change: transform; }
+#entity canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+/* The laptop sits in the entity's box, so it follows it and shrinks with it. */
+#laptop { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; opacity: 0; overflow: visible;
+  transform: translateY(25%) scale(.8); transform-origin: 50% 80%; transition: opacity .25s ease, transform .4s cubic-bezier(.2, .9, .25, 1.2); }
+body.working #laptop { opacity: 1; transform: none; }
+#laptop svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+#laptopImg { position: absolute; width: 64%; aspect-ratio: 420 / 262; background: url(laptop.png) 0 0 / 1900% 100% no-repeat; }
+#statusbar { position: absolute; left: 0; right: 0; top: 0; display: flex; justify-content: space-between; align-items: center;
+  padding: 3.4vw 5vw; font-size: 3.3vw; font-weight: 600; font-variant-numeric: tabular-nums; }
+#statusbar .right { display: flex; align-items: center; gap: 3vw; }
+#wifi { display: flex; align-items: flex-end; gap: .55vw; height: 3vw; }
+#wifi i { width: .9vw; background: var(--text); border-radius: .3vw; opacity: .28; }
+#wifi i:nth-child(1) { height: 30%; } #wifi i:nth-child(2) { height: 53%; } #wifi i:nth-child(3) { height: 76%; } #wifi i:nth-child(4) { height: 100%; }
+#wifi[data-bars="1"] i:nth-child(-n+1), #wifi[data-bars="2"] i:nth-child(-n+2),
+#wifi[data-bars="3"] i:nth-child(-n+3), #wifi[data-bars="4"] i:nth-child(-n+4) { opacity: 1; }
+#wifi[data-bars="0"] { opacity: .5; }
+#battery { display: flex; align-items: center; gap: 1.4vw; }
+#batteryIcon { width: 6.2vw; height: 3vw; border: .45vw solid var(--text); border-radius: .9vw; position: relative; box-sizing: border-box; }
+#batteryIcon::after { content: ""; position: absolute; right: -1.1vw; top: 22%; width: .6vw; height: 56%; background: var(--text); border-radius: 0 .4vw .4vw 0; }
+#chargeFill { position: absolute; left: .35vw; top: .35vw; bottom: .35vw; background: var(--text); border-radius: .35vw; }
+#battery[data-charging="1"] #chargeFill { background: #8FE3A8; }
+#lines { position: absolute; left: 6.5vw; right: 6.5vw; bottom: 8vw; display: flex; flex-direction: column; gap: 2vw;
+  text-shadow: 0 .3vw 1.6vw rgba(0, 0, 0, .85); }
+#userLine { font-size: 3.7vw; color: var(--gray); min-height: 1.3em; }
+#replyLine { font-size: 6.4vw; font-weight: 600; line-height: 1.16; letter-spacing: -.01em; min-height: 2.4em; }
+/* A long phrase is written smaller, so it does not cover the room (data-long is set by the
+   script). */
+#replyLine[data-long="1"] { font-size: 5.2vw; line-height: 1.2; }
+#replyLine[data-long="2"] { font-size: 4.3vw; line-height: 1.25; font-weight: 500; }
+#panel { position: absolute; left: 4vw; right: 4vw; top: 34vw; bottom: 46vw; border-radius: 5vw; overflow: hidden;
+  background: #101014; box-shadow: 0 2vw 9vw rgba(0, 0, 0, .65); display: flex; flex-direction: column; }
+#panel[hidden], #surface[hidden], #list[hidden] { display: none; }
+#viewfinder { position: absolute; right: 5vw; top: 36vw; width: 60vw; border-radius: 5vw;
+  border: .3vw solid rgba(241, 240, 235, .35); box-shadow: 0 2vw 8vw rgba(0, 0, 0, .55); z-index: 4; background: #000; }
+#viewfinder[hidden] { display: none; }
+#viewfinder.shot { border-color: var(--text); }
+#header { flex: none; height: 11vw; display: flex; align-items: center; gap: 2vw; padding: 0 1.5vw 0 5vw; font-size: 3.6vw; font-weight: 600; }
+#title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#close { width: 9vw; height: 9vw; border: 0; border-radius: 50%; background: transparent; color: var(--text); font: 400 6vw/1 "Inter", sans-serif; }
+#surface { flex: 1; min-height: 0; width: 100%; border: 0; background: #fff; }
+#list { flex: 1; min-height: 0; overflow-y: auto; padding: 1vw 3vw 4vw; display: flex; flex-direction: column; gap: 2vw; touch-action: pan-y; }
+#list button { text-align: left; border: 0; border-radius: 3vw; background: #1b1b22; color: var(--text); padding: 3.4vw 4vw; font: 600 4.2vw "Inter", sans-serif; }
+#list button small { display: block; font-weight: 400; font-size: 3.2vw; color: var(--gray); margin-top: .8vw; }
+#list p { color: var(--gray); font-size: 4vw; padding: 4vw 2vw; margin: 0; }
+body.page-open #replyLine { font-size: 4.8vw; min-height: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+body.page-open.typing #panel { bottom: 104vw; }
+#entity, #statusbar, #lines, #compose, #voice, #pages { z-index: 2; }
+#panel { z-index: 3; }
+#keyboard { z-index: 4; }
+#blackout { z-index: 6; }
+#offCharging { z-index: 5; }
+#volume { z-index: 4; }
+/* The page as background: it takes the whole screen in place of the room; the entity, the status
+   bar, the phrase and the place to type stay on top. */
+body.background #panel, body.background.typing #panel { inset: 0; border-radius: 0; z-index: 1; box-shadow: none; }
+body.background #header { position: absolute; right: 2vw; top: 10vw; height: auto; padding: 0; z-index: 1; }
+body.background #title { display: none; }
+body.background #close { background: rgba(5, 5, 7, .78); width: 11vw; height: 11vw; }
+body.background #lines { background: rgba(5, 5, 7, .74); border-radius: 4vw; padding: 3vw 4vw; left: 4vw; right: 4vw; }
+body.background #statusbar { background: linear-gradient(rgba(5, 5, 7, .7), rgba(5, 5, 7, 0)); }
+body.background #compose, body.background #voice, body.background #pages { background: rgba(5, 5, 7, .78); }
+/* The page in full (games): everything goes away but the entity, small in the corner, and a
+   small cross; a tap on the entity talks to it. */
+body.full #panel, body.full.typing #panel { inset: 0; border-radius: 0; z-index: 1; box-shadow: none; }
+body.full #header { position: absolute; right: 1.5vw; top: 1.5vw; height: auto; padding: 0; z-index: 1; }
+body.full #title, body.full #expand, body.background #expand { display: none; }
+body.full #close { background: rgba(5, 5, 7, .55); width: 8vw; height: 8vw; font-size: 4.6vw; }
+body.full #statusbar, body.full #lines, body.full #compose, body.full #voice, body.full #pages, body.full #keyboard { display: none; }
+#expand { width: 9vw; height: 9vw; border: 0; border-radius: 50%; background: transparent; color: var(--text); display: grid; place-items: center; }
+#expand svg { pointer-events: none; }
+#blackout { position: absolute; inset: 0; background: #000; }
+#volume { position: absolute; right: 2.6vw; top: 30vw; width: 10vw; height: 44vw; border-radius: 5vw; background: rgba(18, 18, 22, .82);
+  box-shadow: 0 1vw 4vw rgba(0, 0, 0, .45); overflow: hidden; pointer-events: none; opacity: 0; transform: translateX(16vw) scale(.9);
+  transition: opacity .28s ease, transform .34s cubic-bezier(.2, .9, .25, 1.15); }
+#volume.visible { opacity: 1; transform: none; }
+#volume .fill { position: absolute; left: 0; right: 0; bottom: 0; background: #f2f2f4; transition: height .16s ease-out; }
+#volume svg { position: absolute; left: 50%; bottom: 3vw; width: 5vw; height: 5vw; margin-left: -2.5vw; mix-blend-mode: difference; fill: #f2f2f4; }
+/* Off-charging: only the battery, on black. */
+#offCharging { position: absolute; inset: 0; background: #000; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5vw; touch-action: none; }
+#offCharging[hidden] { display: none; }
+#offCharging .cell { width: 34vw; height: 60vw; border: 1.4vw solid #f2f2f4; border-radius: 6vw; position: relative; display: flex; align-items: flex-end; padding: 1.6vw; box-sizing: border-box; }
+#offCharging .cell::before { content: ''; position: absolute; left: 50%; top: -4.4vw; width: 11vw; height: 3vw; margin-left: -5.5vw; background: #f2f2f4; border-radius: 1.5vw 1.5vw 0 0; }
+#offCharging .level { width: 100%; background: #39d98a; border-radius: 3.6vw; min-height: 3vw; }
+#offCharging .number { font-size: 15vw; font-weight: 600; color: #f2f2f4; }
+#offCharging .caption { font-size: 4.4vw; color: #9a9aa3; }
+#pages { display: grid; place-items: center; position: absolute; right: 6.5vw; bottom: 5vw; width: 12vw; height: 12vw; border-radius: 50%; border: .3vw solid rgba(241, 240, 235, .22);
+  background: rgba(5, 5, 7, .35); color: var(--text); font: 400 5vw/1 "Inter", sans-serif; padding: 0; }
+body.typing #pages { display: none; }
+#pages svg { pointer-events: none; }
+#compose { position: absolute; left: 6.5vw; right: 35.5vw; bottom: 5vw; height: 12vw; border-radius: 6vw; border: .3vw solid rgba(241, 240, 235, .22);
+  background: rgba(5, 5, 7, .35); color: var(--gray); font: 400 4vw "Inter", sans-serif; text-align: left; padding: 0 5vw; }
+body:not(.typing) #lines { bottom: 21vw; }
+body.typing #compose { display: none; }
+#voice { display: grid; place-items: center; position: absolute; right: 21vw; bottom: 5vw; width: 12vw; height: 12vw; border-radius: 50%; border: .3vw solid rgba(241, 240, 235, .22);
+  background: rgba(5, 5, 7, .35); color: var(--text); padding: 0; transition: background .2s, border-color .2s; }
+#voice svg { pointer-events: none; }
+body.typing #voice { display: none; }
+body.listening #voice { border-color: var(--text); background: rgba(241, 240, 235, .16); animation: listening 1.1s ease-in-out infinite; }
+body.transcribing #voice { border-color: var(--text); background: rgba(241, 240, 235, .28); }
+/* Conversation open: the border stays lit even while the entity thinks or replies. */
+body.conversing #voice { border-color: var(--text); }
+@keyframes listening { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.14); } }
+body.typing #lines { bottom: 82vw; }
+#keyboard { position: absolute; left: 0; right: 0; bottom: 0; padding: 2vw 1vw 3vw; background: #0b0b0e; display: flex; flex-direction: column; gap: 1.6vw; }
+#keyboard[hidden] { display: none; }
+#field { margin: 0 2vw 1vw; min-height: 11vw; border-radius: 3vw; background: #17171d; padding: 2.6vw 4vw; box-sizing: border-box; font-size: 4.6vw; line-height: 1.25; overflow-wrap: anywhere; }
+#field::after { content: ""; display: inline-block; width: .5vw; height: 1em; background: var(--text); vertical-align: -.15em; margin-left: .4vw; animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.row { display: flex; justify-content: center; gap: 1.2vw; }
+.key { flex: 1 1 0; max-width: 8.6vw; height: 12.5vw; border: 0; border-radius: 1.8vw; background: #23232c; color: var(--text); font: 400 5.4vw "Inter", sans-serif; padding: 0; }
+.key.wide { flex: 1.6 1 0; max-width: 14vw; background: #17171d; font-size: 4vw; }
+.key.space { flex: 5 1 0; max-width: none; }
+.key.enter { flex: 2.2 1 0; max-width: 20vw; background: var(--text); color: #0b0b0e; font-weight: 600; font-size: 4vw; }
+.key.pressed { background: #3a3a48; }
+#failure { position: absolute; inset: 0; display: grid; place-items: center; padding: 8vw; text-align: center; color: var(--gray); font-size: 4vw; }
+</style>
+<script>
+// Kept apart from the main script: if that one breaks, "pim reload" can still make the page reload.
+new EventSource('events').onmessage = function (m) {
+  if (JSON.parse(m.data).type === 'reload') location.reload();
+};
+</script>
+</head>
+<body>
+<canvas id="room"></canvas>
+<div id="objects"></div>
+<div id="entity"><canvas id="smoke"></canvas><canvas id="eyes"></canvas>
+<!-- The laptop: 19 rendered poses in laptop.png, from 45 degrees left to 45 right; drawLaptop picks one. -->
+<div id="laptop" aria-hidden="true">
+  <svg viewBox="0 0 200 200"><defs><radialGradient id="screenGlow" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#cfe6ff" stop-opacity=".8"/><stop offset="1" stop-color="#cfe6ff" stop-opacity="0"/></radialGradient></defs><ellipse id="laptopGlow" fill="url(#screenGlow)"/></svg>
+  <div id="laptopImg"></div>
+</div></div>
+<div id="statusbar">
+  <span id="clock"></span>
+  <span class="right">
+    <span id="wifi" data-bars="0"><i></i><i></i><i></i><i></i></span>
+    <span id="battery"><span id="percent"></span><span id="batteryIcon"><span id="chargeFill"></span></span></span>
+  </span>
+</div>
+<div id="lines"><div id="userLine"></div><div id="replyLine"></div></div>
+<button id="compose">Scrivi…</button>
+<button id="voice" aria-label="Parla"><svg viewBox="0 0 24 24" width="46%" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg></button>
+<button id="pages" aria-label="Pagine già fatte"><svg viewBox="0 0 24 24" width="46%" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="4" y="3" width="13" height="16" rx="2"/><path d="M8 21h10a2 2 0 0 0 2-2V8"/></svg></button>
+<img id="viewfinder" alt="" hidden>
+<div id="panel" hidden>
+  <div id="header"><span id="title"></span><button id="expand" aria-label="A tutto schermo"><svg viewBox="0 0 24 24" width="55%" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button><button id="close" aria-label="Chiudi">×</button></div>
+  <iframe id="surface" title="Pagina fatta dall'entità" sandbox="allow-scripts allow-forms"></iframe>
+  <div id="list" hidden></div>
+</div>
+<div id="keyboard" hidden><div id="field"></div></div>
+<div id="volume"><div class="fill" id="volumeFill"></div><svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4zm11.5 3a4 4 0 0 0-2-3.5v7a4 4 0 0 0 2-3.5z"/></svg></div>
+<div id="offCharging" hidden><div class="cell"><div class="level" id="offChargingLevel"></div></div><div class="number" id="offChargingNumber">--</div><div class="caption" id="offChargingCaption">In carica</div></div>
+<div id="blackout" hidden></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------- measures ----------
+  // The scene measures, which the shaders receive too (SCENE). The screen width is FIELD units,
+  // with the origin at the center and y pointing up.
+  var FIELD = 3.2, RB = 1.18;
+  var FOCAL = 2.2, BACK_Z = -9.0, FLOOR = -0.95, CEILING = 2.6, HALF_WIDTH = 1.5, EYE_Z = 3.4;
+  var DIVIDER_FIRST = -2.2, DIVIDER_GAP = 2.4;    // the walls between the rooms, in world z
+  var DIVIDERS = [0, 1, 2].map(function (k) { return DIVIDER_FIRST - k * DIVIDER_GAP; });
+  var RES_ROOM = 0.25;                   // room resolution relative to the screen
+  var RES_SMOKE = 200;                   // side of the smoke canvas, in pixels
+  var RES_EYES = 2 * RES_SMOKE;
+  var CALM_AFTER_MS = 3000;              // after this long with nothing happening, half of the frames are skipped
+
+  var COLORS = {
+    blue: [[5, 14, 41], [22, 55, 128], [87, 133, 230]],
+    pink: [[44, 6, 28], [196, 52, 124], [255, 164, 206]],
+    mango: [[38, 13, 2], [176, 80, 10], [255, 190, 100]]
+  };
+
+  // ---------- shaders ----------
+  var SHARED = { RB: RB, FIELD: FIELD, EYE_Z: EYE_Z, FOCAL: FOCAL, BACK_Z: BACK_Z, FLOOR: FLOOR, CEILING: CEILING,
+                 HALF_WIDTH: HALF_WIDTH, DIVIDER_FIRST: DIVIDER_FIRST, DIVIDER_GAP: DIVIDER_GAP };
+  var SCENE = Object.keys(SHARED).map(function (name) {
+    var v = SHARED[name];
+    return 'const float ' + name + ' = ' + (Number.isInteger(v) ? v.toFixed(1) : String(v)) + ';';
+  }).concat('const int DIVIDER_COUNT = ' + DIVIDERS.length + ';').join('\n');
+  var VERTEX = 'attribute vec2 a; void main(){ gl_Position = vec4(a, 0.0, 1.0); }';
+
+  var COMMON = [
+    'precision highp float;',
+    'uniform vec2 uRes; uniform vec3 uDeep; uniform vec3 uMid; uniform vec3 uLight;',
+    SCENE,
+    'const float R0 = 0.78;',
+    'const vec2 EYE = vec2(0.27, 0.0); const vec2 BULB = vec2(0.2, 0.25);',
+    'const vec3 L = vec3(-0.5256, 0.6690, 0.5256);',   // light direction, already normalized
+    'mat2 rot(float a){ float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }'
+  ].join('\n');
+
+  // The room: the corridor with the dividers and the furniture, a light above, the entity's soft
+  // shadow and a thread of its color bouncing off the walls.
+  var ROOM = COMMON + [
+    'uniform vec2 uPos; uniform float uSc; uniform float uDark; uniform vec3 uWalls; uniform vec2 uCam; uniform float uTurn;',
+    'const float RADIUS = 0.62; const float BEHIND_Z = 5.6;',
+    // A divider between two rooms: a wall from side to side with a gap in the middle, which the ray
+    // crosses only through the gap.
+    'float divider(vec3 ro, vec3 rd, float zd, float t){',
+    '  float k = (zd - ro.z) / rd.z; if (k <= 0.0 || k >= t) return t;',
+    '  vec3 q = ro + rd * k; if (abs(q.x) < 0.4 && q.y > FLOOR && q.y < FLOOR + 1.85) return t;',
+    '  return k; }',
+    // uTurn: how far the view turns around itself (0 looks straight to the end of the corridor).
+    'vec3 turn(vec3 v){ float co = cos(uTurn), si = sin(uTurn); return vec3(v.x * co - v.z * si, v.y, v.x * si + v.z * co); }',
+    // The furniture is made of real solids (boxes, cylinders, spheres). Each primitive updates t
+    // and n only if it is nearer than the point already found, so the furniture in front hides what
+    // is behind.
+    'bool box(vec3 ro, vec3 rd, vec3 a, vec3 b, inout float t, inout vec3 n){',
+    '  vec3 d = rd + vec3(1e-7); vec3 i = 1.0 / d; vec3 t1 = (a - ro) * i; vec3 t2 = (b - ro) * i;',
+    '  vec3 lo = min(t1, t2); vec3 hi = max(t1, t2);',
+    '  float tn = max(lo.x, max(lo.y, lo.z)); float tf = min(hi.x, min(hi.y, hi.z));',
+    '  if (tn > tf || tf < 0.0 || tn < 0.0 || tn >= t) return false;',
+    '  n = -sign(d) * step(vec3(tn), lo); t = tn; return true; }',
+    'bool cylinder(vec3 ro, vec3 rd, vec2 c, float r, float y0, float y1, inout float t, inout vec3 n){',
+    '  vec2 o = ro.xz - c; float a = dot(rd.xz, rd.xz); float b = dot(o, rd.xz); float q = dot(o, o) - r * r;',
+    '  float disc = b * b - a * q; if (a < 1e-8 || disc < 0.0) return false;',
+    '  float tt = (-b - sqrt(disc)) / a; if (tt < 0.0 || tt >= t) return false;',
+    '  vec3 p = ro + rd * tt; if (p.y < y0 || p.y > y1) return false;',
+    '  t = tt; n = normalize(vec3(p.x - c.x, 0.0, p.z - c.y)); return true; }',
+    'bool sphere(vec3 ro, vec3 rd, vec3 c, float r, inout float t, inout vec3 n){',
+    '  vec3 o = ro - c; float b = dot(o, rd); float q = dot(o, o) - r * r; float disc = b * b - q;',
+    '  if (disc < 0.0) return false; float tt = -b - sqrt(disc);',
+    '  if (tt < 0.0 || tt >= t) return false;',
+    '  t = tt; n = normalize(ro + rd * tt - c); return true; }',
+    // The furniture, room by room from the front. Gives the color of what is hit in rgb, and in w:
+    // -1 nothing, 0 furniture, 1 a lit lamp.
+    'vec4 furniture(vec3 ro, vec3 rd, inout float t, inout vec3 n){',
+    '  vec4 r = vec4(0.0, 0.0, 0.0, -1.0);',
+    // living room
+    '  if (box(ro, rd, vec3(-0.75, FLOOR, -1.2), vec3(0.45, FLOOR + 0.03, 0.2), t, n)) r = vec4(0.60, 0.42, 0.36, 0.0);',
+    '  if (box(ro, rd, vec3(-0.6, FLOOR + 0.03, -1.0), vec3(0.3, FLOOR + 0.035, 0.0), t, n)) r = vec4(0.78, 0.60, 0.48, 0.0);',
+    '  if (box(ro, rd, vec3(-1.5, FLOOR, -1.3), vec3(-0.95, FLOOR + 0.4, 0.2), t, n)) r = vec4(0.77, 0.54, 0.48, 0.0);',
+    '  if (box(ro, rd, vec3(-1.5, FLOOR + 0.4, -1.3), vec3(-1.3, FLOOR + 0.85, 0.2), t, n)) r = vec4(0.77, 0.54, 0.48, 0.0);',
+    '  if (box(ro, rd, vec3(-1.3, FLOOR + 0.4, -1.25), vec3(-0.95, FLOOR + 0.52, 0.15), t, n)) r = vec4(0.91, 0.86, 0.82, 0.0);',
+    '  if (box(ro, rd, vec3(-0.55, FLOOR + 0.3, -0.6), vec3(-0.1, FLOOR + 0.34, -0.1), t, n)) r = vec4(0.48, 0.35, 0.28, 0.0);',
+    '  if (box(ro, rd, vec3(-0.53, FLOOR, -0.58), vec3(-0.5, FLOOR + 0.3, -0.55), t, n)) r = vec4(0.43, 0.29, 0.21, 0.0);',
+    '  if (box(ro, rd, vec3(-0.15, FLOOR, -0.58), vec3(-0.12, FLOOR + 0.3, -0.55), t, n)) r = vec4(0.43, 0.29, 0.21, 0.0);',
+    '  if (box(ro, rd, vec3(-0.53, FLOOR, -0.15), vec3(-0.5, FLOOR + 0.3, -0.12), t, n)) r = vec4(0.43, 0.29, 0.21, 0.0);',
+    '  if (box(ro, rd, vec3(-0.15, FLOOR, -0.15), vec3(-0.12, FLOOR + 0.3, -0.12), t, n)) r = vec4(0.43, 0.29, 0.21, 0.0);',
+    '  if (box(ro, rd, vec3(1.15, FLOOR, -1.9), vec3(1.5, FLOOR + 1.7, -0.9), t, n)) r = vec4(0.43, 0.29, 0.21, 0.0);',
+    '  if (box(ro, rd, vec3(1.02, FLOOR + 0.05, -1.85), vec3(1.15, FLOOR + 0.5, -0.95), t, n)) r = vec4(0.56, 0.66, 0.71, 0.0);',
+    '  if (box(ro, rd, vec3(1.02, FLOOR + 0.6, -1.85), vec3(1.15, FLOOR + 1.05, -0.95), t, n)) r = vec4(0.85, 0.70, 0.42, 0.0);',
+    '  if (box(ro, rd, vec3(1.02, FLOOR + 1.1, -1.85), vec3(1.15, FLOOR + 1.55, -0.95), t, n)) r = vec4(0.78, 0.54, 0.48, 0.0);',
+    '  if (cylinder(ro, rd, vec2(1.2, 0.9), 0.16, FLOOR, FLOOR + 0.4, t, n)) r = vec4(0.72, 0.41, 0.24, 0.0);',
+    '  if (sphere(ro, rd, vec3(1.2, FLOOR + 0.75, 0.9), 0.32, t, n)) r = vec4(0.30, 0.58, 0.38, 0.0);',
+    '  if (sphere(ro, rd, vec3(1.05, FLOOR + 1.0, 0.8), 0.22, t, n)) r = vec4(0.35, 0.66, 0.44, 0.0);',
+    '  if (sphere(ro, rd, vec3(1.32, FLOOR + 0.95, 1.0), 0.2, t, n)) r = vec4(0.25, 0.49, 0.31, 0.0);',
+    '  if (cylinder(ro, rd, vec2(-1.15, -1.7), 0.03, FLOOR, FLOOR + 1.5, t, n)) r = vec4(0.24, 0.23, 0.27, 0.0);',
+    '  if (cylinder(ro, rd, vec2(-1.15, -1.7), 0.14, FLOOR, FLOOR + 0.04, t, n)) r = vec4(0.24, 0.23, 0.27, 0.0);',
+    '  if (cylinder(ro, rd, vec2(-1.15, -1.7), 0.2, FLOOR + 1.45, FLOOR + 1.7, t, n)) r = vec4(0.95, 0.87, 0.66, 1.0);',
+    // bedroom
+    '  if (box(ro, rd, vec3(0.5, FLOOR, -4.5), vec3(1.5, FLOOR + 0.28, -2.7), t, n)) r = vec4(0.43, 0.29, 0.21, 0.0);',
+    '  if (box(ro, rd, vec3(0.5, FLOOR, -4.55), vec3(1.5, FLOOR + 0.95, -4.45), t, n)) r = vec4(0.43, 0.29, 0.21, 0.0);',
+    '  if (box(ro, rd, vec3(0.53, FLOOR + 0.28, -4.45), vec3(1.47, FLOOR + 0.45, -2.75), t, n)) r = vec4(0.91, 0.86, 0.82, 0.0);',
+    '  if (box(ro, rd, vec3(0.53, FLOOR + 0.45, -3.6), vec3(1.47, FLOOR + 0.5, -2.72), t, n)) r = vec4(0.70, 0.50, 0.45, 0.0);',
+    '  if (box(ro, rd, vec3(0.65, FLOOR + 0.45, -4.35), vec3(1.35, FLOOR + 0.56, -4.1), t, n)) r = vec4(0.96, 0.95, 0.93, 0.0);',
+    '  if (box(ro, rd, vec3(-1.5, FLOOR, -4.45), vec3(-1.0, FLOOR + 1.95, -2.8), t, n)) r = vec4(0.35, 0.23, 0.16, 0.0);',
+    '  if (box(ro, rd, vec3(-0.2, FLOOR, -3.6), vec3(0.35, FLOOR + 0.02, -3.0), t, n)) r = vec4(0.50, 0.61, 0.48, 0.0);',
+    // study
+    '  if (box(ro, rd, vec3(-1.5, FLOOR + 0.72, -6.6), vec3(-0.95, FLOOR + 0.76, -5.2), t, n)) r = vec4(0.48, 0.35, 0.28, 0.0);',
+    '  if (box(ro, rd, vec3(-1.48, FLOOR, -6.58), vec3(-1.45, FLOOR + 0.72, -6.55), t, n)) r = vec4(0.35, 0.23, 0.16, 0.0);',
+    '  if (box(ro, rd, vec3(-1.0, FLOOR, -6.58), vec3(-0.97, FLOOR + 0.72, -6.55), t, n)) r = vec4(0.35, 0.23, 0.16, 0.0);',
+    '  if (box(ro, rd, vec3(-1.48, FLOOR, -5.25), vec3(-1.45, FLOOR + 0.72, -5.22), t, n)) r = vec4(0.35, 0.23, 0.16, 0.0);',
+    '  if (box(ro, rd, vec3(-1.0, FLOOR, -5.25), vec3(-0.97, FLOOR + 0.72, -5.22), t, n)) r = vec4(0.35, 0.23, 0.16, 0.0);',
+    '  if (box(ro, rd, vec3(-0.85, FLOOR + 0.42, -6.0), vec3(-0.6, FLOOR + 0.46, -5.7), t, n)) r = vec4(0.56, 0.66, 0.71, 0.0);',
+    '  if (box(ro, rd, vec3(-0.85, FLOOR + 0.46, -5.75), vec3(-0.6, FLOOR + 0.9, -5.7), t, n)) r = vec4(0.56, 0.66, 0.71, 0.0);',
+    '  if (box(ro, rd, vec3(-0.74, FLOOR, -5.9), vec3(-0.71, FLOOR + 0.42, -5.87), t, n)) r = vec4(0.35, 0.23, 0.16, 0.0);',
+    '  if (cylinder(ro, rd, vec2(1.2, -6.6), 0.14, FLOOR, FLOOR + 0.45, t, n)) r = vec4(0.71, 0.45, 0.42, 0.0);',
+    '  if (sphere(ro, rd, vec3(1.2, FLOOR + 0.85, -6.6), 0.3, t, n)) r = vec4(0.30, 0.58, 0.38, 0.0);',
+    '  if (sphere(ro, rd, vec3(1.1, FLOOR + 1.1, -6.5), 0.2, t, n)) r = vec4(0.35, 0.66, 0.44, 0.0);',
+    // reading corner
+    '  if (box(ro, rd, vec3(0.45, FLOOR, -8.5), vec3(1.3, FLOOR + 0.4, -7.7), t, n)) r = vec4(0.56, 0.66, 0.71, 0.0);',
+    '  if (box(ro, rd, vec3(0.45, FLOOR + 0.4, -8.7), vec3(1.3, FLOOR + 0.9, -8.5), t, n)) r = vec4(0.56, 0.66, 0.71, 0.0);',
+    '  if (box(ro, rd, vec3(0.45, FLOOR + 0.4, -8.5), vec3(0.55, FLOOR + 0.6, -7.7), t, n)) r = vec4(0.48, 0.60, 0.66, 0.0);',
+    '  if (box(ro, rd, vec3(1.2, FLOOR + 0.4, -8.5), vec3(1.3, FLOOR + 0.6, -7.7), t, n)) r = vec4(0.48, 0.60, 0.66, 0.0);',
+    '  if (box(ro, rd, vec3(0.6, FLOOR + 0.4, -8.4), vec3(1.15, FLOOR + 0.5, -7.8), t, n)) r = vec4(0.85, 0.70, 0.42, 0.0);',
+    // bedroom nightstand and lamp
+    '  if (box(ro, rd, vec3(0.1, FLOOR, -4.45), vec3(0.4, FLOOR + 0.5, -4.15), t, n)) r = vec4(0.43, 0.29, 0.21, 0.0);',
+    '  if (cylinder(ro, rd, vec2(0.25, -4.3), 0.02, FLOOR + 0.5, FLOOR + 0.6, t, n)) r = vec4(0.24, 0.23, 0.27, 0.0);',
+    '  if (cylinder(ro, rd, vec2(0.25, -4.3), 0.1, FLOOR + 0.6, FLOOR + 0.75, t, n)) r = vec4(0.95, 0.87, 0.66, 1.0);',
+    // the posts of the gaps between the rooms, in wood
+    '  for (int k = 0; k < DIVIDER_COUNT; k++) {',
+    '    float z = DIVIDER_FIRST - DIVIDER_GAP * float(k);',
+    '    if (box(ro, rd, vec3(-0.46, FLOOR, z - 0.05), vec3(-0.4, FLOOR + 1.9, z + 0.05), t, n)) r = vec4(0.43, 0.29, 0.21, 0.0);',
+    '    if (box(ro, rd, vec3(0.4, FLOOR, z - 0.05), vec3(0.46, FLOOR + 1.9, z + 0.05), t, n)) r = vec4(0.43, 0.29, 0.21, 0.0);',
+    '    if (box(ro, rd, vec3(-0.46, FLOOR + 1.85, z - 0.05), vec3(0.46, FLOOR + 1.9, z + 0.05), t, n)) r = vec4(0.43, 0.29, 0.21, 0.0);',
+    '  }',
+    '  return r; }',
+    // a shadow: is there furniture between the point and the light?
+    'bool shadowed(vec3 p, vec3 l, float dl){ float t = dl; vec3 n = vec3(0.0); return furniture(p, l, t, n).w >= 0.0; }',
+    'void main(){',
+    '  vec2 s = (gl_FragCoord.xy - 0.5 * uRes) / uRes.x * FIELD;',
+    // uCam: where the view is in the corridor (x sideways, z forward). The entity stays still on
+    // the screen.
+    '  vec3 ro = vec3(uCam.x, 0.0, EYE_Z + uCam.y); vec3 rd = turn(normalize(vec3(s, -FOCAL)));',
+    '  vec3 E = ro + turn(vec3(uPos, -FOCAL) * (RADIUS / (R0 * uSc)));',
+    '  float t = 1e9; vec3 n = vec3(0.0); float k;',
+    '  if (rd.y < 0.0) { k = (FLOOR - ro.y) / rd.y; if (k < t) { t = k; n = vec3(0, 1, 0); } }',
+    '  if (rd.y > 0.0) { k = (CEILING - ro.y) / rd.y; if (k < t) { t = k; n = vec3(0, -1, 0); } }',
+    '  if (rd.x < 0.0) { k = (-HALF_WIDTH - ro.x) / rd.x; if (k < t) { t = k; n = vec3(1, 0, 0); } }',
+    '  if (rd.x > 0.0) { k = (HALF_WIDTH - ro.x) / rd.x; if (k < t) { t = k; n = vec3(-1, 0, 0); } }',
+    // the end of the corridor, and a wall behind: so looking back the room does not go dark
+    '  if (rd.z < 0.0) { k = (BACK_Z - ro.z) / rd.z; if (k < t) { t = k; n = vec3(0, 0, 1); } }',
+    '  if (rd.z > 0.0) { k = (BEHIND_Z - ro.z) / rd.z; if (k < t) { t = k; n = vec3(0, 0, -1); } }',
+    '  float tz = t;',
+    '  for (int j = 0; j < DIVIDER_COUNT; j++) t = divider(ro, rd, DIVIDER_FIRST - DIVIDER_GAP * float(j), t);',
+    '  if (t < tz) n = vec3(0, 0, 1);',
+    '  vec4 furn = furniture(ro, rd, t, n); bool hitFurn = furn.w >= 0.0;',
+    '  vec3 p = ro + rd * t;',
+    '  vec3 alb = hitFurn ? furn.rgb : uWalls;',
+    '  vec3 l = vec3(-0.9, 2.3, 1.6) - p; float dl = length(l); l /= dl;',
+    '  float diff = max(dot(n, l), 0.0) / (1.0 + 0.12 * dl * dl);',
+    '  if (diff > 0.0 && shadowed(p + n * 0.01, l, dl)) diff *= 0.3;',
+    '  vec3 toEntity = E - p; float h = clamp(dot(toEntity, l), 0.0, dl); float shade = smoothstep(RADIUS * 0.5, RADIUS * 1.6, length(toEntity - l * h));',
+    '  float edge = 1.0;',
+    '  edge *= mix(smoothstep(0.0, 0.7, HALF_WIDTH - abs(p.x)), 1.0, abs(n.x));',
+    '  edge *= mix(smoothstep(0.0, 0.7, p.y - FLOOR), 1.0, step(0.5, n.y));',
+    '  edge *= mix(smoothstep(0.0, 0.7, CEILING - p.y), 1.0, step(0.5, -n.y));',
+    '  edge *= mix(smoothstep(0.0, 0.7, p.z - BACK_Z), 1.0, abs(n.z));',
+    '  edge = hitFurn ? 1.0 : 0.4 + 0.6 * edge;',
+    '  float ao = hitFurn ? 0.5 + 0.5 * smoothstep(0.0, 0.3, p.y - FLOOR) : 1.0;',
+    '  float de = length(toEntity); float rim = 0.5 * max(dot(n, toEntity / de), 0.0) / (1.0 + 1.3 * de * de);',
+    '  vec3 col = (alb * (0.10 + 3.0 * diff * (0.22 + 0.78 * shade)) * (1.0 - 0.65 * uDark) + uMid * rim) * edge * ao;',
+    // the floor lamp warms the nearby surfaces
+    '  vec3 floorLamp = vec3(-1.15, FLOOR + 1.6, -1.7) - p; float dFloorLamp = length(floorLamp); floorLamp /= dFloorLamp;',
+    '  col += alb * vec3(1.0, 0.72, 0.42) * max(dot(n, floorLamp), 0.0) * 0.8 / (1.0 + 2.0 * dFloorLamp * dFloorLamp) * (0.35 + 0.65 * uDark);',
+    // and the nightstand lamp, in the bedroom
+    '  vec3 bedLamp = vec3(0.25, FLOOR + 0.65, -4.3) - p; float dBedLamp = length(bedLamp); bedLamp /= dBedLamp;',
+    '  col += alb * vec3(1.0, 0.72, 0.42) * max(dot(n, bedLamp), 0.0) * 0.8 / (1.0 + 4.0 * dBedLamp * dBedLamp) * (0.35 + 0.65 * uDark);',
+    // the wall behind gets no lamp light: a little hall light, so it is not black
+    '  if (n.z < -0.5) col += alb * 0.3 * (1.0 - 0.65 * uDark) * edge;',
+    '  if (hitFurn && furn.w > 0.5) col = furn.rgb;',
+    '  col *= exp(-0.16 * max(t - 2.0, 0.0));',
+    '  col += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 120.0;',
+    '  gl_FragColor = vec4(col, 1.0); }'
+  ].join('\n');
+
+  // The smoke: a ball whose edge is displaced by noise warped twice, with its own shadow toward the
+  // light. The noise is read from an image instead of computed (one read per sample in place of
+  // eight computations): the phone cannot keep up otherwise.
+  var SMOKE = COMMON + [
+    'uniform sampler2D uNoise; uniform float uT; uniform float uI; uniform float uEye; uniform float uTilt;',
+    'const float SHELL = 0.30; const float ROTATION = 0.05; const float TWIST = 0.9; const float AGITATION = 0.7;',
+    'const float SWIRL_SCALE = 1.6; const float MASS_SCALE = 2.6; const float RELIEF = 1.7;',
+    'const float EDGE_FROM = 0.04; const float EDGE_TO = 0.6; const float DENSITY = 12.0;',
+    'const float SELF_SHADOW = 1.9; const float REFLECTION = 0.25; const float CONTRAST = 2.2;',
+    'const mat3 M = mat3(0.00, 0.80, 0.60, -0.80, 0.36, -0.48, -0.60, -0.48, 0.64);',
+    // In the image the green is the red shifted by (37, 17): one read gives two neighboring layers.
+    'float vn(vec3 x){ vec3 i = floor(x); vec3 f = fract(x); f = f * f * (3.0 - 2.0 * f);',
+    '  vec2 rg = texture2D(uNoise, (i.xy + vec2(37.0, 17.0) * i.z + f.xy + 0.5) / 256.0).xy; return mix(rg.x, rg.y, f.z); }',
+    'float fbm(vec3 p){ float s = 0.0; float a = 0.5; for (int i = 0; i < 4; i++) { s += a * vn(p); p = M * p * 2.01; a *= 0.5; } return s / 0.9375; }',
+    'float fbm2(vec3 p){ return (vn(p) + 0.5 * vn(M * p * 2.01)) / 1.5; }',
+    'float dens(vec3 p, bool full){',
+    '  float r = length(p); float g = (R0 - r) / SHELL; if (g < -1.0) return 0.0;',
+    '  vec3 q = p; q.xz = rot(TWIST * r + uT * ROTATION) * q.xz; float ag = AGITATION + 0.3 * uI;',
+    '  vec3 w = vec3(vn(q * SWIRL_SCALE + vec3(0.0, uT * 0.55, 0.0)), vn(q * SWIRL_SCALE + vec3(5.2, 1.3, uT * 0.45)), vn(q * SWIRL_SCALE + vec3(uT * 0.4, 8.1, 2.4))) - 0.5;',
+    '  if (!full) { q += w * ag * 0.6; return smoothstep(0.1, 0.5, g + (vn(q * 3.0) - 0.5) * 1.6); }',
+    '  q += w * ag;',
+    '  vec3 w2 = vec3(fbm2(q * SWIRL_SCALE * 1.6 + vec3(1.7, uT * 0.35, 4.2)), fbm2(q * SWIRL_SCALE * 1.6 + vec3(uT * 0.3, 6.3, 0.9)), fbm2(q * SWIRL_SCALE * 1.6 + vec3(3.1, 2.8, uT * 0.32))) - 0.5;',
+    '  q += w2 * ag * 0.8;',
+    '  return smoothstep(EDGE_FROM, EDGE_TO, g + (fbm(q * MASS_SCALE + vec3(0.0, 0.0, uT * 0.28)) - 0.45) * RELIEF); }',
+    'void main(){',
+    '  vec2 c = (gl_FragCoord.xy / uRes * 2.0 - 1.0) * RB; float h2 = RB * RB - dot(c, c);',
+    '  if (h2 <= 0.0) { gl_FragColor = vec4(0.0); return; }',
+    '  vec3 col = vec3(0.0); float T = 1.0;',
+    '  float h = sqrt(h2); const int N = 16; float dz = 2.0 * h / float(N);',
+    '  float z = h - dz * 0.35 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));',
+    '  for (int i = 0; i < N; i++) {',
+    '    vec3 p = vec3(c, z); float d = dens(p, true);',
+    '    if (d > 0.03) {',
+    '      float lit = exp(-2.4 * dens(p + L * 0.3, false) * SELF_SHADOW); float towardViewer = smoothstep(-0.9, 0.9, z);',
+    '      vec3 base = mix(uDeep, uMid, clamp(lit * 0.95 + 0.1 * towardViewer, 0.0, 1.0));',
+    '      base += uLight * pow(lit, CONTRAST) * (0.2 + REFLECTION * towardViewer);',
+    '      float a = 1.0 - exp(-d * dz * DENSITY); col += T * a * base; T *= 1.0 - a; if (T < 0.03) break;',
+    '    }',
+    '    z -= dz;',
+    '  }',
+    // the eye sockets in shadow, where the face will rest the eyes
+    '  vec2 f = rot(uTilt) * c;',
+    '  for (int j = 0; j < 2; j++) {',
+    '    vec2 d = (f - vec2(j == 0 ? -EYE.x : EYE.x, EYE.y)) / (BULB * uEye);',
+    '    col *= 1.0 - 0.42 * smoothstep(2.1, 1.0, dot(d, d));',
+    '  }',
+    '  gl_FragColor = vec4(col, 1.0 - T); }'
+  ].join('\n');
+
+  // The face: two eyeballs (spheres with iris, pupil and highlight), eyelids that are caps in the
+  // smoke's color, tube eyebrows. The light is the same as the smoke's.
+  var EYES = COMMON + [
+    'uniform vec2 uGaze; uniform vec4 uLid; uniform vec4 uBrow; uniform float uPup; uniform float uEye; uniform float uTilt;',
+    'vec4 eyeball(vec2 f, float side, float up, float down){',
+    '  vec2 d = (f - vec2(side * EYE.x, EYE.y)) / (BULB * uEye); float r2 = dot(d, d);',
+    '  if (r2 > 1.0) return vec4(0.0);',
+    '  float z = sqrt(1.0 - r2); vec3 n = vec3(d, z); float lum = max(dot(n, L), 0.0);',
+    '  vec3 col = vec3(0.95, 0.96, 1.0) * (0.62 + 0.5 * lum);',
+    '  col = mix(col, uMid * 0.9, 0.55 * pow(1.0 - z, 1.6));',
+    '  float ca = dot(n, normalize(vec3(uGaze * 1.15, 1.0)));',
+    '  vec3 iris = mix(uMid + uLight * 0.35, uDeep * 1.4, smoothstep(0.76, 0.95, ca)) * (0.75 + 0.5 * lum);',
+    '  iris *= 1.0 - 0.45 * smoothstep(0.82, 0.76, ca);',
+    '  col = mix(col, iris, smoothstep(0.755, 0.775, ca));',
+    '  float pupilEdge = 1.0 - 0.075 * uPup * uPup;',
+    '  col = mix(col, vec3(0.008, 0.012, 0.035), smoothstep(pupilEdge, pupilEdge + 0.012, ca));',
+    '  col += vec3(1.0) * smoothstep(0.955, 0.975, dot(n, normalize(vec3(-0.36, 0.46, 0.81))));',
+    '  col += vec3(0.75) * smoothstep(0.992, 0.997, dot(n, normalize(vec3(0.28, -0.30, 0.91))));',
+    '  down = max(down, 0.46 * smoothstep(0.55, 1.0, up));',
+    '  float yUp = 1.06 - 1.46 * up - 0.22 * d.x * d.x;',
+    '  float yDown = -1.06 + down * (0.9 + 0.7 * (1.0 - d.x * d.x));',
+    '  col *= 1.0 - 0.5 * smoothstep(0.34, 0.0, yUp - d.y);',
+    '  float above = smoothstep(yUp - 0.035, yUp + 0.035, d.y); float below = smoothstep(yDown + 0.035, yDown - 0.035, d.y);',
+    '  vec3 skin = mix(uMid, uLight, 0.3) * (0.4 + 0.9 * lum);',
+    '  col = mix(col, skin, max(above, below));',
+    '  col *= 1.0 - 0.75 * smoothstep(0.07, 0.0, abs(d.y - yUp));',
+    '  col *= 1.0 - 0.45 * smoothstep(0.05, 0.0, abs(d.y - yDown)) * step(0.05, down);',
+    '  return vec4(col, smoothstep(1.0, 0.94, r2)); }',
+    // raise: how high it sits; angle: positive = inner side down (determined), negative = inner
+    // side up (sorry).
+    'vec4 brow(vec2 f, float side, float raise, float angle){',
+    '  vec2 q = f - vec2(side * EYE.x, EYE.y + BULB.y * uEye + 0.075 + 0.10 * raise);',
+    '  float th = side * angle * 0.62; vec2 dir = vec2(cos(th), sin(th));',
+    '  float lx = dot(q, dir); float ly = dot(q, vec2(-dir.y, dir.x)) + 1.5 * lx * lx;',
+    '  float t = clamp(lx, -0.155, 0.155); float thick = 0.046 * (1.0 - 0.45 * smoothstep(0.0, 0.155, -side * t));',
+    '  float dd = length(vec2(lx - t, ly)) / thick; if (dd > 1.0) return vec4(0.0);',
+    '  vec3 n = normalize(vec3((lx - t) / thick, ly / thick, sqrt(1.0 - dd * dd)));',
+    '  return vec4(mix(uDeep, uMid, 0.3) * (0.35 + 1.5 * max(dot(n, L), 0.0)), smoothstep(1.0, 0.8, dd)); }',
+    'void main(){',
+    '  vec2 f = rot(uTilt) * ((gl_FragCoord.xy / uRes * 2.0 - 1.0) * RB);',
+    '  vec3 col = vec3(0.0); float A = 0.0;',
+    '  for (int j = 0; j < 2; j++) {',
+    '    float side = j == 0 ? -1.0 : 1.0;',
+    '    vec4 o = eyeball(f, side, j == 0 ? uLid.x : uLid.y, j == 0 ? uLid.z : uLid.w);',
+    '    col = o.rgb * o.a + col * (1.0 - o.a); A = o.a + A * (1.0 - o.a);',
+    '    o = brow(f, side, j == 0 ? uBrow.x : uBrow.z, j == 0 ? uBrow.y : uBrow.w);',
+    '    col = o.rgb * o.a + col * (1.0 - o.a); A = o.a + A * (1.0 - o.a);',
+    '  }',
+    '  gl_FragColor = vec4(col, A); }'
+  ].join('\n');
+
+  // ---------- canvases ----------
+  function showFailure(why) {
+    console.error('mangOS: ' + why);
+    var d = document.createElement('div');
+    d.id = 'failure';
+    d.textContent = 'La grafica non parte: ' + why;
+    document.body.appendChild(d);
+  }
+
+  // Prepares a canvas with a full-box shader; returns the context and its variables.
+  function makeCanvas(id, fragment, names, transparent) {
+    var canvas = document.getElementById(id);
+    var gl = canvas.getContext('webgl', { antialias: false, alpha: transparent, premultipliedAlpha: true, depth: false, stencil: false });
+    if (!gl) throw new Error('WebGL missing');
+    // If the context is lost and the browser gives it back, the page is reloaded instead of
+    // rebuilding the resources one by one. If it is not given back the graphics stay frozen, but
+    // the page works.
+    canvas.addEventListener('webglcontextlost', function (e) { e.preventDefault(); });
+    canvas.addEventListener('webglcontextrestored', function () { location.reload(); });
+    var prog = gl.createProgram();
+    [[gl.VERTEX_SHADER, VERTEX], [gl.FRAGMENT_SHADER, fragment]].forEach(function (s) {
+      var sh = gl.createShader(s[0]);
+      gl.shaderSource(sh, s[1]);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(id + ': ' + gl.getShaderInfoLog(sh));
+      gl.attachShader(prog, sh);
+    });
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(id + ': ' + gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    var a = gl.getAttribLocation(prog, 'a');
+    gl.enableVertexAttribArray(a);
+    gl.vertexAttribPointer(a, 2, gl.FLOAT, false, 0, 0);
+    var u = {};
+    names.concat(['uRes', 'uDeep', 'uMid', 'uLight']).forEach(function (n) { u[n] = gl.getUniformLocation(prog, n); });
+    return { canvas: canvas, gl: gl, u: u };
+  }
+
+  // The noise image: 256 x 256 random values in the red, and in the green the same shifted.
+  function noiseImage(t) {
+    var gl = t.gl, data = new Uint8Array(256 * 256 * 4), seed = 12345, x, y;
+    for (y = 0; y < 256; y++) for (x = 0; x < 256; x++) {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      data[(y * 256 + x) * 4] = seed >>> 24;
+    }
+    for (y = 0; y < 256; y++) for (x = 0; x < 256; x++)
+      data[(y * 256 + x) * 4 + 1] = data[(((y + 17) & 255) * 256 + ((x + 37) & 255)) * 4];
+    gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 256, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.uniform1i(t.u.uNoise, 0);
+  }
+
+  // If the graphics do not start only drawing is skipped: keyboard, voice and events remain.
+  var room, smoke, eyes, graphics = false;
+  try {
+    room = makeCanvas('room', ROOM, ['uPos', 'uSc', 'uDark', 'uWalls', 'uCam', 'uTurn'], false);
+    smoke = makeCanvas('smoke', SMOKE, ['uNoise', 'uT', 'uI', 'uEye', 'uTilt'], true);
+    eyes = makeCanvas('eyes', EYES, ['uGaze', 'uLid', 'uBrow', 'uPup', 'uEye', 'uTilt'], true);
+    noiseImage(smoke);
+    graphics = true;
+  } catch (e) {
+    showFailure(e.message);
+  }
+
+  var entityBox = document.getElementById('entity');
+  var W = 0, H = 0, side = 0;
+  function measure() {
+    W = window.innerWidth; H = window.innerHeight;
+    side = 2 * RB * W / FIELD;           // side of the box when the entity has size 1
+    entityBox.style.width = entityBox.style.height = side + 'px';
+    if (!graphics) return;
+    [[room, Math.round(W * RES_ROOM), Math.round(H * RES_ROOM)], [smoke, RES_SMOKE, RES_SMOKE], [eyes, RES_EYES, RES_EYES]].forEach(function (t) {
+      t[0].canvas.width = t[1]; t[0].canvas.height = t[2];
+      t[0].gl.viewport(0, 0, t[1], t[2]);
+      t[0].gl.uniform2f(t[0].u.uRes, t[1], t[2]);
+    });
+    roomView = null;
+  }
+  function setTint(name) {
+    if (!graphics) return;
+    var c = COLORS[name] || COLORS.blue;
+    [room, smoke, eyes].forEach(function (t) {
+      ['uDeep', 'uMid', 'uLight'].forEach(function (n, i) { t.gl.uniform3f(t.u[n], c[i][0] / 255, c[i][1] / 255, c[i][2] / 255); });
+    });
+    roomView = null;
+  }
+
+  // ---------- faces ----------
+  // upper/lower: eyelids (0 open, 1 closed); browHeight/browTilt: height and tilt of the eyebrows;
+  // L and R are the eye on the left and on the right of the screen. gx/gy fix the gaze, otherwise
+  // it follows the finger. scale and y: size and height of the entity in the room. dark: how much
+  // the light is lowered.
+  var FACES = {
+    neutral:    { upperL: .04, upperR: .04, lowerL: .2, lowerR: .2, browHeightL: .45, browTiltL: -.18, browHeightR: .45, browTiltR: -.18, pup: 1.3, eye: 1.05, intensity: .35, tilt: .05, dark: 0, scale: .85, y: .5 },
+    happy:      { upperL: .05, upperR: .05, lowerL: .5, lowerR: .5, browHeightL: .6, browTiltL: -.25, browHeightR: .6, browTiltR: -.25, pup: 1.18, eye: 1.05, intensity: .55, tilt: 0, dark: 0, scale: .92, y: .55 },
+    surprised:  { upperL: 0, upperR: 0, lowerL: 0, lowerR: 0, browHeightL: 1.1, browTiltL: -.3, browHeightR: 1.1, browTiltR: -.3, pup: .72, eye: 1.16, intensity: .6, tilt: 0, dark: 0, scale: .95, y: .58 },
+    focused:    { upperL: .26, upperR: .26, lowerL: .2, lowerR: .2, browHeightL: -.75, browTiltL: .5, browHeightR: -.75, browTiltR: .5, pup: .92, eye: 1, intensity: .95, tilt: 0, dark: 0, scale: 1.05, y: .42 },
+    sorry:      { upperL: .3, upperR: .3, lowerL: 0, lowerR: 0, browHeightL: .35, browTiltL: -.95, browHeightR: .35, browTiltR: -.95, pup: 1.25, eye: 1.02, intensity: .2, tilt: -.08, dark: .15, scale: .72, y: .38, gx: 0, gy: -.5 },
+    doubtful:   { upperL: .16, upperR: .3, lowerL: 0, lowerR: .22, browHeightL: 1.0, browTiltL: -.2, browHeightR: -.6, browTiltR: .4, pup: 1, eye: 1, intensity: .4, tilt: .17, dark: 0, scale: .88, y: .5 },
+    knowing:    { upperL: .08, upperR: .08, lowerL: .35, lowerR: .35, browHeightL: .5, browTiltL: -.1, browHeightR: .1, browTiltR: .15, pup: 1.1, eye: 1, intensity: .4, tilt: -.1, dark: 0, scale: .9, y: .5 },
+    sleepy:     { upperL: .6, upperR: .64, lowerL: .05, lowerR: .05, browHeightL: -.3, browTiltL: -.3, browHeightR: -.3, browTiltR: -.3, pup: 1.1, eye: 1, intensity: .15, tilt: .06, dark: .35, scale: .74, y: .4, gx: 0, gy: -.3 },
+    asleep:     { upperL: 1, upperR: 1, lowerL: 0, lowerR: 0, browHeightL: -.2, browTiltL: -.35, browHeightR: -.2, browTiltR: -.35, pup: 1, eye: 1, intensity: .08, tilt: .1, dark: 1, scale: .62, y: .32, gx: 0, gy: -.4 }
+  };
+  var KEYS = ['upperL', 'upperR', 'lowerL', 'lowerR', 'browHeightL', 'browTiltL', 'browHeightR', 'browTiltR', 'pup', 'eye', 'intensity', 'tilt', 'dark'];
+
+  var userLine = document.getElementById('userLine'), replyLine = document.getElementById('replyLine');
+  var face = 'neutral', current = {}, body3d = { x: 0, y: .5, s: .85, vx: 0, vy: 0, vs: 0 };
+  KEYS.forEach(function (k) { current[k] = FACES.neutral[k]; });
+  var gaze = { x: 0, y: 0 }, aim = { x: 0, y: 0 }, finger = null, fingerUntil = 0, nextGlance = 0;
+  var blinks = [], nextBlink = 2, gestures = [], smokeTime = 20, now = 0;
+  var roomView = null, paused = false, typing = false, inPanel = false, fullPage = false, inViewfinder = false;
+  var elObjects = document.getElementById('objects');
+  var working = false, elGlow = document.getElementById('laptopGlow');
+  // While working the entity sits as on a swivel chair: now and then it turns a little, slides a
+  // little, rises or sinks, and the laptop turns with it.
+  var swivel = { yaw: 0, x: 0, y: 0, tyaw: 0, tx: 0, ty: 0, next: 0 };
+  var elLaptopImg = document.getElementById('laptopImg'), POSES = 19, POSE_STEP = 5;
+
+  // Shows the pose closest to `yaw` (radians, positive turns the keyboard to the left) and moves
+  // the laptop around the entity as the chair turns; `bob` lifts it with the keys (percent).
+  function drawLaptop(yaw, bob) {
+    var deg = yaw * 180 / Math.PI;
+    var pose = Math.max(0, Math.min(POSES - 1, Math.round(deg / POSE_STEP) + (POSES - 1) / 2));
+    elLaptopImg.style.backgroundPositionX = (pose / (POSES - 1) * 100) + '%';
+    elLaptopImg.style.left = (18 + 14 * Math.sin(yaw)).toFixed(2) + '%';
+    elLaptopImg.style.top = (55 + bob).toFixed(2) + '%';
+    elGlow.setAttribute('cx', (100 + 28 * Math.sin(yaw)).toFixed(1)); elGlow.setAttribute('cy', 108);
+    elGlow.setAttribute('rx', 70); elGlow.setAttribute('ry', 34);
+  }
+  drawLaptop(0, 0);
+
+  function blink(which, after) { blinks.push({ t: now + (after || 0), side: which || 0 }); }
+  function closure(which) {
+    var v = 0;
+    blinks = blinks.filter(function (b) { return now - b.t < 0.3; });
+    blinks.forEach(function (b) {
+      if (b.side && b.side !== which) return;
+      var dt = now - b.t;
+      v = Math.max(v, dt < 0 ? 0 : dt < .07 ? dt / .07 : dt < .11 ? 1 : dt < .26 ? 1 - (dt - .11) / .15 : 0);
+    });
+    return v;
+  }
+  function makeGesture(type) { gestures.push({ type: type, t: now }); }
+  function setFace(name) { if (FACES[name]) face = name; }
+
+  // What the rest of the system can ask of the entity.
+  window.pim = {
+    face: function (name) { blink(0); setFace(name); },
+    say: function (text) { replyLine.textContent = text; },
+    // working: the laptop appears in front of it and it types on it with its head down
+    work: function (active) { working = !!active; document.body.classList.toggle('working', working); nextGlance = 0; },
+    heard: function (text) { userLine.textContent = text ? '«' + text + '»' : ''; blink(0); },
+    // a message that arrived while it works: it will read it when done
+    queued: function (text) { userLine.textContent = '«' + text + '» · in coda: lo legge appena finisce'; },
+    gesture: function (type) { if (type === 'wink') { blink(1, 0.05); blink(1, 0.14); blink(1, 0.23); } else makeGesture(type); },
+    // walk along the corridor: forward, back, left, right, by how much (1 = one long step); forward
+    // and back follow the view; left and right are sideways relative to the view
+    walk: function (direction, amount) {
+      var q = Math.max(0, Math.min(6, Number(amount) || 1));
+      if (direction === 'forward') stepBy(q, 0); else if (direction === 'back') stepBy(-q, 0);
+      else if (direction === 'left') stepBy(0, -q * 0.5); else if (direction === 'right') stepBy(0, q * 0.5);
+    },
+    // turn the view: left or right, by how much (1 = about 20 degrees)
+    turn: function (direction, amount) {
+      var q = Math.max(0, Math.min(6, Number(amount) || 1));
+      if (direction === 'left') camTarget.g -= q * TURN_STEP; else if (direction === 'right') camTarget.g += q * TURN_STEP;
+    }
+  };
+
+  function fingerPoint(e) {
+    finger = { x: (e.clientX - W / 2) / W * FIELD, y: (H / 2 - e.clientY) / W * FIELD };
+    fingerUntil = now + 2;
+    activity();
+  }
+  document.addEventListener('pointermove', fingerPoint);
+  // A touch that does not move greets (jump, or wake-up); a moving finger walks along the corridor.
+  function greet(e) {
+    fingerPoint(e);
+    if (face === 'asleep' || face === 'sleepy') {
+      setFace('surprised');
+      blink(0); blink(0, 0.3);
+      setTimeout(function () { if (face === 'surprised') setFace('neutral'); }, 1200);
+    } else {
+      makeGesture('jump');
+      blink(0);
+    }
+  }
+  // The corridor: where the view is (x sideways, z forward); the room follows it with a spring. g
+  // is the view angle: 0 looks to the end of the corridor, positive turns right.
+  var cam = { x: 0, z: 0, g: 0 }, camTarget = { x: 0, z: 0, g: 0 }, drag = null, walking = 0;
+  var TURN_STEP = 0.35;                 // radians per turn unit
+  // a step in the view direction: forward (amount) and sideways (right positive)
+  function stepBy(forward, side) {
+    var g = camTarget.g;
+    moveTo(camTarget.x + forward * Math.sin(g) + side * Math.cos(g), camTarget.z - forward * Math.cos(g) + side * Math.sin(g));
+  }
+  function roomOf(zw) { // 0 front, 1 after the first divider, and so on
+    return DIVIDERS.filter(function (d) { return zw < d; }).length;
+  }
+  // You go from one room to the next only through the gap, at the center of the divider.
+  function moveTo(x, z) {
+    // near a gap the corridor pulls to the center, so you pass without bumping
+    DIVIDERS.forEach(function (d) { if (Math.abs(EYE_Z + z - d) < 0.9) x *= 0.4; });
+    x = Math.max(-0.9, Math.min(0.9, x));
+    z = Math.max(-11, Math.min(1.6, z));
+    DIVIDERS.forEach(function (d) {
+      var before = EYE_Z + cam.z - d, after = EYE_Z + z - d;
+      if (before * after < 0 && Math.abs(x) > 0.4) z = (before > 0 ? d + 0.05 : d - 0.05) - EYE_Z;
+    });
+    camTarget.x = x;
+    camTarget.z = z;
+  }
+  document.addEventListener('pointerdown', function (e) {
+    // where the touch does something else, or nothing (screen off), it neither greets nor drags
+    if (e.target.closest('#keyboard, #compose, #voice, #pages, #panel, #blackout, #offCharging')) return;
+    if (typing) { setKeyboard(false); return; }                       // closes the keyboard without starting a drag
+    drag = { x: e.clientX, y: e.clientY, l: e.clientX, m: e.clientY, moved: false, e: e };
+  });
+  document.addEventListener('pointermove', function (e) {
+    if (!drag) return;
+    var dx = e.clientX - drag.l, dy = e.clientY - drag.m;
+    // under two millimeters it is a trembling finger tap, not a step
+    if (!drag.moved && Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < W * 0.03) return;
+    drag.moved = true;
+    drag.l = e.clientX; drag.m = e.clientY;
+    // the finger pulls the world: sideways turns the view, up goes forward in the view direction
+    camTarget.g -= dx * 0.005;
+    stepBy(-dy * FIELD / W * 1.2, 0);
+  });
+  function fingerUp() {
+    if (drag && !drag.moved) {
+      if (onEntity(drag.e)) talkTo(drag.e); else greet(drag.e);
+    }
+    drag = null;
+  }
+  // Whether the finger is on the entity's body (the round of smoke, not its whole square).
+  function onEntity(e) {
+    var r = entityBox.getBoundingClientRect();
+    return Math.hypot(e.clientX - (r.left + r.width / 2), e.clientY - (r.top + r.height / 2)) < r.width * 0.36;
+  }
+  // A tap on the entity: it jumps, says it is there and listens to one phrase (the bridge opens the
+  // mic once, after the greeting); the next tap listens again. A tap while it listens closes.
+  function talkTo(e) {
+    fingerPoint(e);
+    makeGesture('jump');
+    blink(0);
+    toggleVoice({ once: true, greet: true });
+  }
+  document.addEventListener('pointerup', fingerUp);
+  document.addEventListener('pointercancel', function () { drag = null; });
+
+  // ---------- frame loop ----------
+  var lastFrame = 0, frameCount = 0, countSince = 0;
+  // Asks the bridge for something (a POST with `body`, a GET without) and reads the whole reply,
+  // even if not needed: an unread reply keeps shared memory busy that the browser frees only when
+  // it feels like it, and in the long run the screen goes black.
+  function request(url, body) {
+    var options = body === undefined
+      ? { cache: 'no-store' }
+      : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+    return fetch(url, options)
+      .then(function (r) { return r.text().then(function (text) { return { ok: r.ok, status: r.status, text: text }; }); });
+  }
+  function postJson(url, body) {
+    return request(url, body).then(function (r) { if (!r.ok) throw new Error(url + ': status ' + r.status); });
+  }
+  function getJson(url) {
+    return request(url).then(function (r) {
+      if (!r.ok) throw new Error(url + ': status ' + r.status);
+      return JSON.parse(r.text);
+    });
+  }
+  // The loop stops with the screen off, since nothing would be seen and drawing heats the phone; the
+  // screen turning on, or the page becoming visible, starts it again.
+  var running = false;
+  function startFrames() {
+    if (graphics && !running) { running = true; requestAnimationFrame(frame); }
+  }
+  document.addEventListener('visibilitychange', startFrames);
+  // When something last happened that the person may be watching (a touch, an event, the keyboard).
+  var lastActivity = 0, skipFrame = false, smokeTurn = 0;
+  function activity() { lastActivity = performance.now(); }
+  function frame(ms) {
+    if (document.hidden || paused) { running = false; lastFrame = 0; countSince = 0; return; }
+    requestAnimationFrame(frame);
+    // The smoke moves slowly: with nothing going on, drawing every other frame is not noticed.
+    if (ms - lastActivity > CALM_AFTER_MS && !working && !typing && !gestures.length && !blinks.length && (skipFrame = !skipFrame)) return;
+    var dt = lastFrame ? Math.min((ms - lastFrame) / 1000, 0.1) : 0;
+    lastFrame = ms;
+    // Every five seconds it tells the bridge how many frames per second it has drawn (`pim
+    // status`).
+    if (!countSince) { countSince = ms; frameCount = 0; }
+    frameCount++;
+    if (ms - countSince >= 5000) {
+      // "active": the person is typing or the camera is open, and the screen must not turn off.
+      postJson('metrics', { fps: Math.round(frameCount * 10000 / (ms - countSince)) / 10, active: typing || inViewfinder })
+        .catch(function (e) { console.error('mangOS: metrics not delivered: ' + e.message); });
+      countSince = ms; frameCount = 0;
+    }
+    now += dt;
+
+    var F = FACES[face], k = 1 - Math.exp(-dt * 13);
+    KEYS.forEach(function (c) { current[c] += (F[c] - current[c]) * k; });
+
+    // The body is a spring: when it changes place or size it bounces a little. With the keyboard
+    // open the entity moves up and shrinks, to stay visible above it.
+    var goalScale = F.scale * (typing ? 0.78 : 1), goalX = swivel.x, goalY = F.y + (typing ? 0.62 : 0);
+    // With a page open it stays small in the top left corner, under the status bar.
+    if (inPanel || inViewfinder) { goalScale = 0.3; goalX = -0.82; goalY = (H / 2 - 0.19 * W) / W * FIELD; }
+    // A page in full has no status bar: smaller, and right in the corner, to cover as little as possible.
+    if (fullPage && !inViewfinder) { goalScale = 0.2; goalX = -0.88; goalY = (H / 2 - 0.08 * W) / W * FIELD; }
+    body3d.vs += ((goalScale - body3d.s) * 90 - body3d.vs * 11) * dt; body3d.s += body3d.vs * dt;
+    body3d.vx += ((goalX - body3d.x) * 90 - body3d.vx * 11) * dt; body3d.x += body3d.vx * dt;
+    body3d.vy += ((goalY - body3d.y) * 90 - body3d.vy * 11) * dt; body3d.y += body3d.vy * dt;
+    // The corridor follows its own spring; while walking the entity makes a little hop at every
+    // step.
+    var kc = 1 - Math.exp(-dt * 7);
+    var before = Math.hypot(cam.x - camTarget.x, cam.z - camTarget.z);
+    cam.x += (camTarget.x - cam.x) * kc; cam.z += (camTarget.z - cam.z) * kc;
+    cam.g += (camTarget.g - cam.g) * (1 - Math.exp(-dt * 9));
+    walking += (Math.min(1, before * 3) - walking) * (1 - Math.exp(-dt * 8));
+    var dy = Math.sin(now * 1.3) * 0.018 + walking * 0.02 * Math.abs(Math.sin(now * 9)), dTilt = 0;
+    gestures = gestures.filter(function (g) { return now - g.t < 1.4; });
+    gestures.forEach(function (g) {
+      var t = now - g.t, damp = Math.exp(-3.2 * t);
+      if (g.type === 'yes') dy += 0.09 * Math.sin(t * 17) * damp;
+      if (g.type === 'jump') { dy += 0.16 * Math.sin(Math.min(t * 5.5, Math.PI)) * (t < 0.6 ? 1 : 0); dTilt += 0.05 * Math.sin(t * 14) * damp; }
+    });
+
+    // Working: the body trembles to the rhythm of the keys, the screen light dances on its face,
+    // the eyes run along the lines and now and then it looks up at whoever is watching.
+    if (working && now > swivel.next) {
+      swivel.tyaw = (Math.random() < 0.5 ? -1 : 1) * (0.35 + Math.random() * 0.45);
+      swivel.tx = (Math.random() - 0.5) * 0.24;
+      swivel.ty = (Math.random() - 0.5) * 0.08;
+      swivel.next = now + 2.5 + Math.random() * 4;
+    } else if (!working) { swivel.tyaw = swivel.tx = swivel.ty = 0; swivel.next = 0; }
+    var ks = 1 - Math.exp(-dt * 1.6);
+    swivel.yaw += (swivel.tyaw - swivel.yaw) * ks; swivel.x += (swivel.tx - swivel.x) * ks; swivel.y += (swivel.ty - swivel.y) * ks;
+    if (working) {
+      dy += 0.007 * Math.sin(now * 41) + 0.004 * Math.sin(now * 67) + swivel.y;
+      dTilt += 0.018 * Math.sin(now * 23) - 0.06 * swivel.yaw;
+      elGlow.setAttribute('opacity', (0.7 + 0.3 * Math.sin(now * 31) * Math.sin(now * 7.3)).toFixed(2));
+      drawLaptop(swivel.yaw, 0.3 * Math.sin(now * 41));
+      if (now > nextGlance) {
+        var up = Math.random() < 0.1;
+        aim.x = up ? 0 : (Math.random() - 0.5) * 0.9 + 0.6 * Math.sin(swivel.yaw);
+        aim.y = up ? 0.05 : -0.62;
+        nextGlance = now + (up ? 0.8 : 0.15 + Math.random() * 0.35);
+      }
+    }
+    // The gaze: follows the finger while there is one, then looks around by itself.
+    else if (F.gx !== undefined) { aim.x = F.gx; aim.y = F.gy; }
+    else if (finger && now < fingerUntil) {
+      var gx = (finger.x - body3d.x) / 1.3, gy = (finger.y - body3d.y) / 1.3, len = Math.hypot(gx, gy);
+      if (len > 0.7) { gx *= 0.7 / len; gy *= 0.7 / len; }
+      aim.x = gx; aim.y = gy;
+    } else if (now > nextGlance) {
+      var straight = Math.random() < 0.45;
+      aim.x = straight ? 0 : (Math.random() - 0.5) * 0.7;
+      aim.y = straight ? 0 : (Math.random() - 0.5) * 0.4;
+      nextGlance = now + 1.2 + Math.random() * 2.6;
+    }
+    var kg = 1 - Math.exp(-dt * 20);
+    gaze.x += (aim.x - gaze.x) * kg; gaze.y += (aim.y - gaze.y) * kg;
+
+    if (face !== 'asleep' && now > nextBlink) {
+      blink(0);
+      if (Math.random() < 0.2) blink(0, 0.3);
+      nextBlink = now + 2.4 + Math.random() * 3.6;
+    }
+    var blinkL = closure(-1), blinkR = closure(1);
+    smokeTime += dt * (0.12 + 0.85 * current.intensity);
+
+    var s = Math.max(0.3, body3d.s), y = body3d.y + dy, tilt = current.tilt + dTilt;
+
+    // The box follows the entity without redrawing anything.
+    entityBox.style.transform = 'translate(' + (W / 2 + body3d.x * W / FIELD - side / 2) + 'px,' + (H / 2 - y * W / FIELD - side / 2) + 'px) scale(' + s + ')';
+
+    // The room is redrawn only if the entity has moved enough to change shadow and reflections.
+    if (!roomView || Math.abs(roomView.x - body3d.x) > 0.006 || Math.abs(roomView.y - body3d.y) > 0.006 || Math.abs(roomView.s - s) > 0.006 || Math.abs(roomView.dark - current.dark) > 0.01 || Math.abs(roomView.cx - cam.x) > 0.002 || Math.abs(roomView.cz - cam.z) > 0.002 || Math.abs(roomView.g - cam.g) > 0.002) {
+      roomView = { x: body3d.x, y: body3d.y, s: s, dark: current.dark, cx: cam.x, cz: cam.z, g: cam.g };
+      elObjects.style.filter = 'brightness(' + (0.82 - 0.5 * current.dark) + ')';
+      room.gl.uniform2f(room.u.uPos, body3d.x, body3d.y);
+      room.gl.uniform1f(room.u.uSc, s);
+      room.gl.uniform1f(room.u.uDark, current.dark);
+      room.gl.uniform2f(room.u.uCam, cam.x, cam.z);
+      room.gl.uniform1f(room.u.uTurn, cam.g);
+      placeObjects();
+      room.gl.drawArrays(room.gl.TRIANGLES, 0, 3);
+    }
+
+    // Under an open page the entity is small and the page needs the GPU: the smoke is drawn one frame in four.
+    if (!inPanel || (smokeTurn = (smokeTurn + 1) & 3) === 0) {
+      smoke.gl.uniform1f(smoke.u.uT, smokeTime);
+      smoke.gl.uniform1f(smoke.u.uI, current.intensity);
+      smoke.gl.uniform1f(smoke.u.uEye, current.eye);
+      smoke.gl.uniform1f(smoke.u.uTilt, tilt);
+      smoke.gl.drawArrays(smoke.gl.TRIANGLES, 0, 3);
+    }
+
+    eyes.gl.uniform2f(eyes.u.uGaze, gaze.x, gaze.y);
+    eyes.gl.uniform4f(eyes.u.uLid, current.upperL + (1 - current.upperL) * blinkL, current.upperR + (1 - current.upperR) * blinkR, current.lowerL, current.lowerR);
+    eyes.gl.uniform4f(eyes.u.uBrow, current.browHeightL - 0.25 * blinkL, current.browTiltL, current.browHeightR - 0.25 * blinkR, current.browTiltR);
+    eyes.gl.uniform1f(eyes.u.uPup, current.pup);
+    eyes.gl.uniform1f(eyes.u.uEye, current.eye);
+    eyes.gl.uniform1f(eyes.u.uTilt, tilt);
+    eyes.gl.clearColor(0, 0, 0, 0);
+    eyes.gl.clear(eyes.gl.COLOR_BUFFER_BIT);
+    eyes.gl.drawArrays(eyes.gl.TRIANGLES, 0, 3);
+  }
+
+  // ---------- status bar ----------
+  var elClock = document.getElementById('clock'), elWifi = document.getElementById('wifi');
+  var elBattery = document.getElementById('battery'), elPercent = document.getElementById('percent'), elChargeFill = document.getElementById('chargeFill');
+  var name = '';
+  function updateClock() {
+    var d = new Date();
+    elClock.textContent = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+  }
+  var elVolume = document.getElementById('volume'), elVolumeFill = document.getElementById('volumeFill'), volumeTimer = 0;
+  function showVolume(level) {
+    elVolumeFill.style.height = level + '%';
+    elVolume.classList.add('visible');
+    clearTimeout(volumeTimer);
+    volumeTimer = setTimeout(function () { elVolume.classList.remove('visible'); }, 1600);
+  }
+  var elOffCharging = document.getElementById('offCharging'), elOffChargingNumber = document.getElementById('offChargingNumber');
+  var elOffChargingLevel = document.getElementById('offChargingLevel'), elOffChargingCaption = document.getElementById('offChargingCaption');
+  function refreshStatus() {
+    getJson('status').then(function (s) {
+      var charge = s.battery === null ? '--' : s.battery + '%';
+      elPercent.textContent = charge;
+      elOffChargingNumber.textContent = charge;
+      elOffChargingLevel.style.height = Math.max(4, s.battery) + '%';
+      elOffChargingCaption.textContent = s.charging ? 'In carica' : s.battery >= 99 ? 'Carica' : 'Collegato';
+      elChargeFill.style.width = 'calc(' + Math.max(4, s.battery) + '% - .7vw)';
+      elBattery.dataset.charging = s.charging ? '1' : '0';
+      // dBm: above -55 the signal is full, below -75 it is weak; null = not connected
+      elWifi.dataset.bars = s.wifi === null ? 0 : s.wifi > -55 ? 4 : s.wifi > -65 ? 3 : s.wifi > -75 ? 2 : 1;
+      if (s.name !== name) {
+        name = s.name;
+        setTint(s.color);
+        // after a reload the bridge gives back the last phrase: the greeting must not cover it
+        if (!replyLine.textContent) replyLine.textContent = 'Ciao, sono ' + name + '.';
+      }
+    }).catch(function (e) {
+      // Without the status the bar shows it does not know it, not a made-up value.
+      console.error('mangOS: ' + e.message);
+      elPercent.textContent = '--';
+      elWifi.dataset.bars = 0;
+    });
+  }
+
+  // ---------- keyboard ----------
+  var elKeyboard = document.getElementById('keyboard'), elField = document.getElementById('field'), elCompose = document.getElementById('compose');
+  var LAYOUTS = {
+    letters: ['q w e r t y u i o p', 'a s d f g h j k l', 'SHIFT z x c v b n m BACKSPACE', 'NUMBERS , SPACE . ENTER'],
+    numbers: ['1 2 3 4 5 6 7 8 9 0', "à è é ì ò ù ? ! '", '@ € - : ; ( ) " BACKSPACE', 'LETTERS , SPACE . ENTER']
+  };
+  var LABELS = { SHIFT: '⇧', BACKSPACE: '⌫', NUMBERS: '123', LETTERS: 'abc', SPACE: '', ENTER: 'Invia' };
+  var typed = '', layout = 'letters', upper = true;
+  function drawKeyboard() {
+    elKeyboard.querySelectorAll('.row').forEach(function (r) { r.remove(); });
+    LAYOUTS[layout].forEach(function (row) {
+      var div = document.createElement('div');
+      div.className = 'row';
+      row.split(' ').forEach(function (k) {
+        var b = document.createElement('button');
+        b.className = 'key' + (k === 'SPACE' ? ' space' : k === 'ENTER' ? ' enter' : k.length > 1 ? ' wide' : '');
+        b.dataset.key = k;
+        b.textContent = k in LABELS ? LABELS[k] : (upper && layout === 'letters' ? k.toUpperCase() : k);
+        if (k === 'SHIFT' && upper) b.classList.add('pressed');
+        div.appendChild(b);
+      });
+      elKeyboard.appendChild(div);
+    });
+  }
+  function setKeyboard(open) {
+    typing = open;
+    activity();
+    document.body.classList.toggle('typing', open);
+    elKeyboard.hidden = !open;
+    if (open) { layout = 'letters'; upper = !typed; drawKeyboard(); }
+  }
+  function send() {
+    var text = typed.trim();
+    if (!text) return;
+    typed = ''; elField.textContent = '';
+    setKeyboard(false);
+    userLine.textContent = '«' + text + '»';
+    postJson('user', { type: 'text', text: text })
+      .catch(function (e) {
+        console.error('mangOS: ' + e.message);
+        replyLine.textContent = 'Non riesco a mandare il messaggio.';
+        if (!typed) { typed = text; elField.textContent = text; }     // the text stays in the field, to retry
+      });
+  }
+  elCompose.addEventListener('pointerdown', function (e) { e.preventDefault(); e.stopPropagation(); setKeyboard(true); });
+  // The keys act when the finger lands. "Invia" closes the keyboard and the finger lifts over what
+  // was underneath (the pages button), which would take it for its own tap: so a tap that began on
+  // the keyboard counts for nothing else.
+  var fingerOnKeyboard = false;
+  document.addEventListener('pointerdown', function (e) { fingerOnKeyboard = !!e.target.closest('#keyboard'); }, true);
+  document.addEventListener('click', function (e) { if (fingerOnKeyboard) { e.stopPropagation(); e.preventDefault(); } }, true);
+
+  // ---------- phrase size ----------
+  new MutationObserver(function () {
+    var n = replyLine.textContent.length;
+    replyLine.dataset.long = n > 150 ? 2 : n > 70 ? 1 : 0;
+  }).observe(replyLine, { childList: true, characterData: true, subtree: true });
+
+  // ---------- viewfinder ----------
+  // What the camera sees while the entity uses it: first live, then the shot, which stays a few
+  // seconds. The images are prepared by mangos-photo and served by the bridge.
+  var elViewfinder = document.getElementById('viewfinder'), viewfinderRun = 0;
+  function setViewfinder(open) { inViewfinder = open; elViewfinder.hidden = !open; }
+  function cameraEvent(state, number) {
+    var mine = ++viewfinderRun;
+    if (state === 'closed') { setViewfinder(false); return; }
+    elViewfinder.src = '/camera.jpg?' + number;
+    elViewfinder.classList.toggle('shot', state === 'shot');
+    setViewfinder(true);
+    // If the images stop arriving (shot done, or program dead) the viewfinder closes by itself,
+    // using the real clock: the frame clock stands still with the screen off.
+    setTimeout(function () { if (mine === viewfinderRun) setViewfinder(false); }, state === 'shot' ? 6000 : 4000);
+  }
+
+  // ---------- voice ----------
+  // A tap on the microphone opens the voice conversation: the phone listens for a phrase, the
+  // bridge has it transcribed and delivers it as if it had been typed, and when the entity has
+  // replied the microphone reopens by itself. Another tap closes it. The bridge says how far along
+  // it is with the states heard, open, listening, transcribing, done, nothing, failed, closed.
+  var elVoice = document.getElementById('voice'), beforeVoice = '';
+  // A phrase and a face for a few seconds; then they go back as they were, unless something else
+  // changed them in the meantime.
+  function flash(phrase, expression, ms) {
+    replyLine.textContent = phrase;
+    setFace(expression);
+    setTimeout(function () {
+      if (replyLine.textContent === phrase) replyLine.textContent = beforeVoice;
+      if (face === expression) setFace('neutral');
+    }, ms);
+  }
+  function voiceEvent(state, text) {
+    // What has been understood so far, while the person speaks: listening continues.
+    if (state === 'heard') { window.pim.heard(text); return; }
+    if (state === 'open' || state === 'closed') { document.body.classList.toggle('conversing', state === 'open'); if (state === 'open') return; }
+    document.body.classList.toggle('listening', state === 'listening');
+    document.body.classList.toggle('transcribing', state === 'transcribing');
+    if (state === 'listening') { beforeVoice = replyLine.textContent; replyLine.textContent = 'Ti ascolto…'; setFace('surprised'); blink(0); }
+    else if (state === 'transcribing') { replyLine.textContent = '…'; setFace('focused'); }
+    else if (state === 'done') replyLine.textContent = '…';        // the phrase is delivered: now the entity speaks
+    else if (state === 'nothing') flash('Non ho sentito niente.', 'doubtful', 2500);
+    else if (state === 'failed') flash(text || 'Il microfono non è pronto.', 'sorry', 3000);
+  }
+  // Opens the conversation, or closes the open one; `body` is what POST /voice takes.
+  function toggleVoice(body) {
+    if (!document.body.classList.contains('conversing')) beforeVoice = replyLine.textContent;
+    request('voice', body)
+      .then(function (r) { if (!r.ok) voiceEvent('failed', JSON.parse(r.text).error); })
+      .catch(function (err) { voiceEvent('failed', 'Il ponte non risponde.'); console.error('mangOS: voice: ' + err.message); });
+  }
+  elVoice.addEventListener('pointerdown', function (e) {
+    e.preventDefault(); e.stopPropagation();
+    toggleVoice({});
+  });
+  // The key nearest the finger: a tap landing between two keys counts for the nearest one.
+  function nearestKey(x, y) {
+    var chosen = null, minDist = Infinity;
+    elKeyboard.querySelectorAll('.key').forEach(function (b) {
+      var r = b.getBoundingClientRect();
+      var dx = Math.max(r.left - x, 0, x - r.right), dy = Math.max(r.top - y, 0, y - r.bottom), d = dx * dx + dy * dy;
+      if (d < minDist) { minDist = d; chosen = b; }
+    });
+    return chosen;
+  }
+  // Holding the delete key keeps deleting until the finger lifts.
+  var deleting = 0;
+  function stopDeleting() { clearTimeout(deleting); clearInterval(deleting); deleting = 0; }
+  document.addEventListener('pointerup', stopDeleting, true);
+  document.addEventListener('pointercancel', stopDeleting, true);
+  elKeyboard.addEventListener('pointerdown', function (e) {
+    var b = e.target.closest('.key') || (e.target.closest('#field') ? null : nearestKey(e.clientX, e.clientY));
+    e.preventDefault();
+    // The touch stops here: redrawing the keys makes the pressed one leave the page, and the rest
+    // of the UI would mistake it for a tap outside the keyboard, closing it.
+    e.stopPropagation();
+    if (!b) return;
+    var k = b.dataset.key, redraw = false;
+    if (k === 'ENTER') { send(); return; }
+    if (k === 'BACKSPACE') {
+      typed = typed.slice(0, -1);
+      stopDeleting();
+      deleting = setTimeout(function () {
+        deleting = setInterval(function () {
+          typed = typed.slice(0, -1); elField.textContent = typed;
+          if (!typed && !upper) { upper = true; drawKeyboard(); }
+        }, 70);
+      }, 400);
+      // everything deleted, start again with the capital
+      if (!typed && !upper) { upper = true; redraw = true; }
+    } else if (k === 'SPACE') typed += ' ';
+    else if (k === 'SHIFT') { upper = !upper; redraw = true; }
+    else if (k === 'NUMBERS') { layout = 'numbers'; redraw = true; }
+    else if (k === 'LETTERS') { layout = 'letters'; redraw = true; }
+    else {
+      typed += upper && layout === 'letters' ? k.toUpperCase() : k;
+      // the capital counts for one letter only, and returns after a period
+      if (upper && layout === 'letters') { upper = false; redraw = true; }
+    }
+    if (/[.?!] $/.test(typed) && !upper) { upper = true; redraw = true; }
+    elField.textContent = typed;
+    // The touched key lights up for a moment, even when the keys have been redrawn.
+    if (redraw) {
+      drawKeyboard();
+      b = Array.prototype.filter.call(elKeyboard.querySelectorAll('.key'), function (t) { return t.dataset.key === k; })[0];
+    }
+    if (b && k !== 'SHIFT') { b.classList.add('pressed'); setTimeout(function () { b.classList.remove('pressed'); }, 120); }
+  });
+
+  // ---------- commands from the bridge ----------
+  var elPanel = document.getElementById('panel'), elSurface = document.getElementById('surface'), elList = document.getElementById('list');
+  var elTitle = document.getElementById('title'), elBlackout = document.getElementById('blackout');
+  // Opens the panel on a page, on the list of pages, or closes it (no arguments).
+  var shownPage = null;  // the page open now: { title, url }
+  function openPanel(title, url, mode) {
+    inPanel = title !== undefined;
+    fullPage = inPanel && mode === 'full';
+    shownPage = url ? { title: title, url: url } : null;
+    document.body.classList.toggle('page-open', inPanel);
+    document.body.classList.toggle('background', inPanel && mode === 'background');
+    document.body.classList.toggle('full', fullPage);
+    elPanel.hidden = !inPanel;
+    elSurface.hidden = !url;
+    elList.hidden = !inPanel || !!url;
+    elTitle.textContent = title || '';
+    // about:blank and not removing src: the closed page would stay alive, hidden.
+    elSurface.src = url || 'about:blank';
+  }
+  function collection() {
+    openPanel('Pagine');
+    elList.textContent = '';
+    getJson('pages').then(function (pages) {
+      if (!pages.length) {
+        var empty = document.createElement('p');
+        empty.textContent = 'Ancora nessuna pagina. Chiedimene una.';
+        elList.appendChild(empty);
+      }
+      pages.forEach(function (p) {
+        var b = document.createElement('button'), when = document.createElement('small');
+        b.textContent = p.title;
+        when.textContent = p.when;
+        b.appendChild(when);
+        b.addEventListener('click', function () { openPanel(p.title, p.url, p.mode); });
+        elList.appendChild(b);
+      });
+    }).catch(function (e) { console.error('mangOS: ' + e.message); });
+  }
+  document.getElementById('close').addEventListener('click', function () {
+    openPanel();
+    // The bridge must know too, or at the next reload the closed page would reopen.
+    postJson('command', { type: 'surface', url: null })
+      .catch(function (e) { console.error('mangOS: ' + e.message); });
+  });
+  document.getElementById('pages').addEventListener('click', function () { if (inPanel && elSurface.hidden) openPanel(); else collection(); });
+  // ---------- the phone for the pages (mangos.js) ----------
+  // A page runs isolated: it asks with postMessage, and only the page open now is listened to,
+  // only for what mangos.js offers. The bridge does the rest.
+  var sensorTimer = null;
+  function pageSensors(target, rate) {
+    clearInterval(sensorTimer);
+    sensorTimer = null;
+    if (!rate) return;
+    sensorTimer = setInterval(function () {
+      if (elSurface.contentWindow !== target || !shownPage) { clearInterval(sensorTimer); sensorTimer = null; return; }
+      getJson('sensors').then(function (s) { target.postMessage({ mangosSensors: s }, '*'); })
+        .catch(function (e) { console.error('mangOS: sensors: ' + e.message); });
+    }, 1000 / Math.max(1, Math.min(50, rate)));
+  }
+  window.addEventListener('message', function (e) {
+    var m = e.data;
+    if (!m || typeof m.mangos !== 'number' || e.source !== elSurface.contentWindow) return;
+    var args = m.args || {};
+    function answer(result, error) { e.source.postMessage({ mangosReply: m.mangos, result: result, error: error }, '*'); }
+    if (m.action === 'sensors') { pageSensors(e.source, +args.rate || 0); answer(true); return; }
+    if (['vibrate', 'speak', 'photo'].indexOf(m.action) < 0) { answer(null, 'richiesta sconosciuta'); return; }
+    request('device', { action: m.action, ms: args.ms, text: args.text, front: args.front })
+      .then(function (r) {
+        var reply = JSON.parse(r.text || '{}');
+        if (r.ok) answer(m.action === 'photo' ? reply.url : true); else answer(null, reply.error || 'non riuscito');
+      })
+      .catch(function (err) { answer(null, err.message); });
+  });
+
+  // From the window to the whole screen; the bridge remembers it, for the collection and reloads.
+  document.getElementById('expand').addEventListener('click', function () {
+    if (!shownPage) return;
+    postJson('command', { type: 'surface', mode: 'full', title: shownPage.title, url: shownPage.url })
+      .catch(function (e) { console.error('mangOS: ' + e.message); });
+  });
+
+  // ---------- furnishing ----------
+  // Objects live in the room's space, with the same perspective as the shader: in CSS the focal
+  // length is "perspective" and objects are moved in depth by (z - EYE_Z + FOCAL), all measured in
+  // pixels per room unit.
+  var FRONT_Z = 1.8;
+  var house = { walls: '#1d1f24', objects: [] };
+  var placed = [];  // each object with its place in the corridor
+  function furnish() {
+    var n = parseInt(house.walls.slice(1), 16), u = W / FIELD;
+    if (graphics) room.gl.uniform3f(room.u.uWalls, ((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
+    roomView = null;
+    elObjects.style.perspective = FOCAL * u + 'px';
+    elObjects.textContent = '';
+    placed = house.objects.map(function (o) {
+      var img = document.createElement('img'), wide = o.size * 2 * HALF_WIDTH, x, y, z, yaw = 0, anchor = '-50%';
+      // Every room has its stretch of corridor, between two dividers: "near" is toward the front,
+      // "far" toward the back.
+      var k = o.room || 0, nearZ = k === 0 ? FRONT_Z : DIVIDERS[k - 1], farZ = k === 3 ? BACK_Z : DIVIDERS[k];
+      // The corridor is fixed: x and z are in the world, and the view passes by it.
+      if (o.where === 'floor') { // standing: x from wall to wall, near from back to front
+        x = o.x * (HALF_WIDTH - wide / 2 - 0.05); y = FLOOR; z = farZ + 0.15 + o.near * (nearZ - farZ - 0.3); anchor = '-100%';
+      } else if (o.where === 'wall') { // wall at the back of the room: x from -1 to 1, y from floor to ceiling
+        x = o.x * HALF_WIDTH; y = FLOOR + o.y * (CEILING - FLOOR); z = farZ + 0.01;
+      } else { // side walls: x from 0 (back) to 1 (front), y as above
+        x = (o.where === 'left' ? -1 : 1) * (HALF_WIDTH - 0.01); y = FLOOR + o.y * (CEILING - FLOOR); z = farZ + o.x * (nearZ - farZ);
+        yaw = o.where === 'left' ? 90 : -90;
+      }
+      img.src = 'house-files/' + encodeURIComponent(o.file);
+      img.alt = '';
+      img.style.width = wide * u + 'px';
+      img.style.left = '50%'; img.style.top = '50%';
+      elObjects.appendChild(img);
+      return { img: img, x: x, y: y, z: z, yaw: yaw, anchor: anchor };
+    });
+    placeObjects();
+  }
+  // Puts each object where it is relative to the view: those behind are hidden.
+  function placeObjects() {
+    var u = W / FIELD, eye = EYE_Z + cam.z, currentRoom = roomOf(eye);
+    // the view turns around the eye: the objects are brought into its frame (as the shader does)
+    var c = Math.cos(cam.g), si = Math.sin(cam.g), degrees = cam.g * 180 / Math.PI;
+    placed.forEach(function (v) {
+      var dx = v.x - cam.x, dz = v.z - eye;
+      var lx = dx * c + dz * si, lz = -dx * si + dz * c;
+      // behind, or in another room (the divider hides it): not visible
+      var behind = lz > -0.3 || roomOf(v.z) !== currentRoom;
+      v.img.style.display = behind ? 'none' : '';
+      if (behind) return;
+      v.img.style.transform = 'translate3d(' + lx * u + 'px,' + -v.y * u + 'px,' + (lz + FOCAL) * u + 'px) rotateY(' + (v.yaw + degrees) + 'deg) translate(-50%,' + v.anchor + ')';
+    });
+  }
+  function loadHouse() {
+    getJson('house').then(function (c) { house = c; furnish(); })
+      .catch(function (e) { console.error('mangOS: ' + e.message); });
+  }
+
+  var events = new EventSource('events');
+  events.onmessage = function (m) {
+    var e = JSON.parse(m.data);
+    activity();
+    if (e.type === 'face') window.pim.face(e.name);
+    else if (e.type === 'say') window.pim.say(e.text);
+    else if (e.type === 'heard') window.pim.heard(e.text);
+    else if (e.type === 'gesture') window.pim.gesture(e.name);
+    else if (e.type === 'work') window.pim.work(e.active);
+    else if (e.type === 'queued') window.pim.queued(e.text);
+    else if (e.type === 'voice') voiceEvent(e.state, e.text);
+    else if (e.type === 'camera') cameraEvent(e.state, e.number);
+    else if (e.type === 'surface') { if (e.url) openPanel(e.title || 'Pagina', e.url, e.mode); else openPanel(); }
+    else if (e.type === 'walk') window.pim.walk(e.direction, e.amount);
+    else if (e.type === 'turn') window.pim.turn(e.direction, e.amount);
+    else if (e.type === 'house') loadHouse();
+    else if (e.type === 'volume') showVolume(e.level);
+    else if (e.type === 'off_charging') { elOffCharging.hidden = !e.active; if (e.active) refreshStatus(); }
+    else if (e.type === 'screen') { if (e.on && paused) refreshStatus(); elBlackout.hidden = e.on; paused = !e.on; if (e.on) startFrames(); }
+  };
+
+  window.addEventListener('resize', function () { measure(); furnish(); });
+  measure();
+  setTint('blue');
+  furnish();
+  loadHouse();
+  updateClock(); setInterval(updateClock, 5000);
+  // With the screen off the bar is not visible: the status is not requested.
+  refreshStatus(); setInterval(function () { if (!paused) refreshStatus(); }, 10000);
+  startFrames();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+# mangOS bridge: serves the UI, reads keys and touch, receives the commands for the entity.
+
+description="Bridge between screen, keys and agent"
+supervisor=supervise-daemon
+command=/usr/bin/mangos-bridge
+output_log=/var/log/mangos-bridge.log
+error_log=/var/log/mangos-bridge.log
+respawn_delay=2
+respawn_max=0
+
+depend() {
+	need localmount
+	after bootmisc udev-trigger
+}

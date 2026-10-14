@@ -1,0 +1,7 @@
+config CHARGER_SM5714
+	tristate "Silicon Mitus SM5714 charger and fuel gauge"
+	depends on I2C
+	help
+	  Charger and fuel gauge of the Silicon Mitus SM5714, found in
+	  Samsung Exynos 850 phones such as the SM-M135F.
+
